@@ -1,0 +1,33 @@
+# Patient data and generated artifacts (PHI — never commit)
+data/
+feedback.csv
+
+# Runtime / logs
+streamlit_log.txt
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.python-version
+
+# Excel temp / lock files
+~$*.xlsx
+~$*.xls
+*.tmp
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code workspace settings (personal, not for repo)
+.claude/
+
+# Streamlit
+.streamlit/secrets.toml
