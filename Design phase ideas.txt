@@ -1,0 +1,4 @@
+Ideas design phase. If there is multiple correct options the patient can go to just distribute them evenly. If we later then dont signal based on the wrong % going to a certain option (they dont know that anyways so it is no possible to preprogram) we can just check whether the patient goes to any of the options :). Boom done. But how to now suggest ideas and how to quantify them if you do select a better product. Let claude think about that maybe. Probably should try to estimate in the design phase the number of patient dagen that are in it (same way you calculated ideas earlier) find the users that started with this drug for this diagnosis last year and sum up how much they used. 
+
+Make an AI chatbot with which you can make the Sankey Diagram (easy its just needs to export this flows table on the bottom depending on what the user puts in. Try this with the documents that she send you). 
+

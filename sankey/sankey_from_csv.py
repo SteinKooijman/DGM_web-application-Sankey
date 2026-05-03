@@ -28,22 +28,27 @@ from sankey.sankey_functions import _sankey_positions
 
 def aggregate_flows(flows_df: pd.DataFrame, level: str) -> pd.DataFrame:
     """
-    Collapse prod_id-level rows to the chosen display level.
+    Set source_label / target_label on a flows DataFrame that is already at the
+    requested grain (one CSV per grain — see backend/csv_builder.py).
 
     Parameters
     ----------
-    flows_df : rows from sankey_edited.csv (or sankey_original.csv) for one diagnosis
+    flows_df : rows from sankey_edited_<grain>.csv / sankey_original_<grain>.csv
+               for one diagnosis. Already at the requested grain.
     level    : "prod_id" | "prod_nm" | "medicine_name" | "group_name"
 
-    Returns a new DataFrame with added columns:
-        source_label, target_label
-    and days_treated / pat_count summed over merged rows.
-    Heritage is taken as the most-common value within each merged group.
+    For prod_id grain, the label is "Prod_omschr (prod_id)" so users see a
+    descriptive name in the diagram. For coarser grains the label IS the value
+    in the corresponding canonical column.
+
+    Heritage is taken as the most-common value within each merged group (groups
+    only collapse heritage variants of the same flow — flows themselves are
+    already at the right grain).
     """
     df = flows_df.copy()
 
-    # Virtual Source node has empty source_prod_id — always label it "Source"
-    is_source = df["source_prod_id"].astype(str).str.strip().isin(["", "nan", "NaN"])
+    # Virtual Source node: source_layer == 0 and source label columns are blank.
+    is_source = df["source_layer"].astype(int) == 0
 
     if level == "prod_id":
         omschr_map = load_prod_omschr_lookup()
@@ -82,19 +87,13 @@ def aggregate_flows(flows_df: pd.DataFrame, level: str) -> pd.DataFrame:
         )
         .reset_index()
     )
-    # Drop self-loops that arise from aggregation: when multiple prod_ids for the
-    # same medicine (or group) are merged, source_label and target_label can
-    # collapse to the same string (e.g. infliximab → infliximab).  Those rows
-    # carry no information at this display level — the patient simply stays on
-    # the same medicine, so the flow should terminate at the source node.
-    agg = agg[agg["source_label"] != agg["target_label"]].reset_index(drop=True)
 
-    # Recompute per-patient ratios and effective stuks_dag after aggregation
+    # Recompute per-patient ratios and effective stuks_dag after the heritage
+    # roll-up. (No self-loops are possible here: flows are stored at grain.)
     pc  = agg["pat_count"].replace(0, float("nan"))
     dt  = agg["days_treated"].replace(0, float("nan"))
     agg["gem_aantal_per_pat"] = (agg["sum_aantal"] / pc).round(2).fillna(0)
     agg["days_per_pat"]       = (agg["days_treated"] / pc).round(2).fillna(0)
-    # Effective stuks_dag = sum_aantal / days_treated (consistent with the formula)
     agg["stuks_dag"]          = (agg["sum_aantal"] / dt).round(6).fillna(1.0)
     return agg
 

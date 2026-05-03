@@ -2,9 +2,17 @@ import pandas as pd
 from pathlib import Path
 
 # ── Input / Output paths ───────────────────────────────────────────────────────
-INPUT_T2    = Path("data/T2_prod_price.xlsx")
-INPUT_T1    = Path("data/product_diagnosis_catalogue_v02.xlsx")
-INPUT_T4    = Path(r"C:\2_KSA\1_DGM\9_WebApp_v3\99_latest_versions_input\T4_EUK_diag.xlsx")
+INPUT_DIR   = Path(r"C:\2_KSA\1_DGM\9_WebApp_v3\99_latest_versions_input")
+
+def _latest(prefix: str) -> Path:
+    matches = sorted(INPUT_DIR.glob(f"{prefix}*.xlsx"))
+    if not matches:
+        raise FileNotFoundError(f"No file matching {prefix}*.xlsx in {INPUT_DIR}")
+    return matches[-1]
+
+INPUT_T1    = _latest("T1_")
+INPUT_T2    = _latest("T2_")
+INPUT_T4    = _latest("T4_")
 OUTPUT_FILE = Path("data/product_diagnosis_catelogue_v5.xlsx")
 
 # ── Dosage Type multipliers for "Dosage Height/toediening" ────────────────────
@@ -20,9 +28,23 @@ t2 = pd.read_excel(INPUT_T2)
 t1 = pd.read_excel(INPUT_T1)
 t4 = pd.read_excel(INPUT_T4, usecols=["Diag_ID_EUK", "Diag_omschr_EUK"])
 
-# ── Left join T2 ← T1 on Medicine Name (case-insensitive) ────────────────────
-t2["_key"] = t2["Medicine Name"].str.strip().str.lower()
-t1["_key"] = t1["Medicine Name"].str.strip().str.lower()
+# Drop T1 rows where dosing is zero/missing — they create NaN per-dag values
+# in the merge and can win the v5 dedup, masking the real dosing row.
+_dose_h = pd.to_numeric(t1["Dosage Height"], errors="coerce")
+_dose_f = pd.to_numeric(t1["Dosage Frequency"], errors="coerce")
+t1 = t1[(_dose_h.fillna(0) > 0) & (_dose_f.fillna(0) > 0)].copy()
+
+# ── Left join T2 ← T1 on Medicine Name + Administration Method (case-insensitive) ──
+t2["_key"] = (
+    t2["Medicine Name"].astype(str).str.strip().str.lower()
+    + "|"
+    + t2["Administration Method"].astype(str).str.strip().str.lower()
+)
+t1["_key"] = (
+    t1["Medicine Name"].astype(str).str.strip().str.lower()
+    + "|"
+    + t1["Administration Method"].astype(str).str.strip().str.lower()
+)
 
 result = t2.merge(
     t1.drop(columns=["Medicine Name"]),

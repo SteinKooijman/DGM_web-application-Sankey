@@ -25,10 +25,12 @@ from backend.csv_builder import (
     V4_CATALOGUE_PATH,
     generate_catalogue_csv,
     import_catalogue_from_v4,
+    invalidate_sankey_caches,
     load_catalogue_csv,
     load_patient_cache,
     save_patient_cache,
 )
+from backend.sidebar import inject_shared_css
 
 # ---------------------------------------------------------------------------
 # Page config + shared styling
@@ -40,28 +42,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-st.markdown(
-    """
-    <style>
-    [data-testid="stAppViewContainer"] { background-color: #F6F8FA; }
-    [data-testid="stSidebar"]          { background-color: #003545 !important; }
-    [data-testid="stSidebar"] *        { color: #E0F2FE !important; }
-    [data-testid="stSidebar"] input,
-    [data-testid="stSidebar"] textarea { color: #003545 !important; }
-    [data-testid="stSidebar"] button   { color: #003545 !important; }
-    [data-testid="stSidebar"] [data-baseweb="select"] * { color: #003545 !important; }
-    h1, h2, h3 { color: #0F1923 !important; }
-    hr { border-color: #E5E7EB !important; }
-    .info-box {
-        background: #F0F9FF; border-left: 4px solid #29B5E8;
-        border-radius: 8px; padding: 10px 16px;
-        font-size: 0.88rem; color: #003545;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+inject_shared_css()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -122,7 +103,10 @@ def _try_load_t2() -> pd.DataFrame:
 with st.sidebar:
     st.markdown("## ⚗️ Sankey-Ideas")
     st.markdown("---")
-    st.page_link("app.py", label="📊 Naar Sankey-dashboard", icon="📊")
+    st.page_link("app.py",                   label="📊 Samenvatting",  icon="📊")
+    st.page_link("pages/2_Ontwerp.py",       label="✏️ Ontwerp",       icon="✏️")
+    st.page_link("pages/3_Implementatie.py", label="🔍 Implementatie", icon="🔍")
+    st.page_link("pages/4_Upload.py",        label="📂 Upload",        icon="📂")
 
 # ---------------------------------------------------------------------------
 # Page header
@@ -211,6 +195,7 @@ if pat_upload is not None:
 
         if st.button("💾 Patiëntendata opslaan", type="primary", use_container_width=True):
             save_patient_cache(pat_df)
+            invalidate_sankey_caches()
             st.success(f"✅ Opgeslagen: {n_rows:,} rijen voor {n_diag} diagnoses.")
             st.cache_data.clear()
 

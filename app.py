@@ -1,39 +1,45 @@
 """
-Sankey-Ideas  —  Live filter edition
--------------------------------------
-Patient data and product catalogue are uploaded once via the Upload page
-(pages/Upload.py).  This page reads the cached patient data and always
-computes the Sankey live from the sidebar filters (diagnosis, date range,
-voorschrijver).  No pre-baked Sankey CSV is needed.
+Sankey-Ideas — Samenvatting (per-diagnose overzicht)
+----------------------------------------------------
+Eerste van drie pagina's per diagnose:
+  - Samenvatting   (deze pagina) — financieel overzicht + Sankey + per-product
+  - Ontwerp        (pages/2_Ontwerp.py)
+  - Implementatie  (pages/3_Implementatie.py)
+
+KPI-totalen rekenen met ALLE behandelrecords binnen het filtervenster
+(niet alleen nieuwe patiënten); de Sankey toont nog steeds NIEUWE patiënten.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from datetime import datetime
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backend.csv_builder import (
-    CATALOGUE_CSV,
     LEVEL_COLS,
-    SANKEY_EDITED_CSV,
-    SANKEY_ORIGINAL_CSV,
     cascade_and_save_flow,
-    generate_sankey_csv,
     get_node_capacity,
     load_catalogue_csv,
     load_patient_cache,
+    load_prod_omschr_lookup,
     load_sankey_csv,
-    reset_edited_for_diagnosis,
 )
-from backend.feedback_utils import load_feedback, save_idea
 from backend.financial_utils import compute_kpis_from_patients
+from backend.sidebar import (
+    ALL_DIAGNOSES,
+    ensure_sankey_current,
+    filter_records_in_window,
+    inject_shared_css,
+    render_sidebar,
+)
 from sankey.sankey_from_csv import aggregate_flows, build_sankey_from_csv
 
 # ---------------------------------------------------------------------------
@@ -41,55 +47,12 @@ from sankey.sankey_from_csv import aggregate_flows, build_sankey_from_csv
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Sankey-Ideas | Apotheek",
-    page_icon="⚗️",
+    page_title="Samenvatting | Sankey-Ideas",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-st.markdown(
-    """
-    <style>
-    [data-testid="stAppViewContainer"] { background-color: #F6F8FA; }
-    [data-testid="stSidebar"]          { background-color: #003545 !important; }
-    [data-testid="stSidebar"] *        { color: #E0F2FE !important; }
-    [data-testid="stSidebar"] input,
-    [data-testid="stSidebar"] textarea                       { color: #003545 !important; }
-    [data-testid="stSidebar"] button                         { color: #003545 !important; }
-    [data-testid="stSidebar"] [data-baseweb="select"] *      { color: #003545 !important; }
-    [data-testid="stSidebar"] [data-baseweb="input"] *       { color: #003545 !important; }
-    [data-testid="stSidebar"] [data-baseweb="datepicker"] *  { color: #003545 !important; }
-    [data-testid="stSidebar"] [data-testid="stAlert"],
-    [data-testid="stSidebar"] [data-testid="stAlert"] *      { color: inherit !important; }
-    h1, h2, h3 { color: #0F1923 !important; }
-    hr { border-color: #E5E7EB !important; }
-
-    .kpi-card {
-        background: white; border-radius: 12px; padding: 18px 22px;
-        box-shadow: 0 1px 6px rgba(0,0,0,.08); border-top: 4px solid #29B5E8;
-        min-height: 110px;
-    }
-    .kpi-card .label { font-size: 0.78rem; font-weight: 600; color: #64748B;
-                       text-transform: uppercase; letter-spacing: .04em; }
-    .kpi-card .value { font-size: 1.65rem; font-weight: 700; color: #0F1923; margin: 4px 0; }
-    .kpi-card .delta { font-size: 0.82rem; font-weight: 600; }
-    .kpi-card .delta.pos { color: #16a34a; }
-    .kpi-card .delta.neg { color: #dc2626; }
-
-    .info-box {
-        background: #F0F9FF; border-left: 4px solid #29B5E8;
-        border-radius: 8px; padding: 10px 16px;
-        font-size: 0.88rem; color: #003545;
-    }
-    .section-header { font-size: 1.05rem; font-weight: 700; color: #11567F; margin-bottom: 4px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+inject_shared_css()
 
 LEVEL_LABELS = {
     "prod_id":       "Prod_ID (meest gedetailleerd)",
@@ -97,11 +60,6 @@ LEVEL_LABELS = {
     "medicine_name": "Medicijn",
     "group_name":    "Therapeutische groep",
 }
-
-REDEN_OPTIONS = sorted([
-    "Volgens richtlijn", "Financieel voordeel", "Patiëntvoorkeur",
-    "Te hoge stijging in uitgaven en/of vergoedingen", "Actie verkoop", "Overig",
-])
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -113,21 +71,11 @@ def _fmt_eur(val: float) -> str:
     return f"€ {val:,.0f}"
 
 
-def _delta_html(delta: float, invert: bool = False) -> str:
-    if abs(delta) < 1:
-        return ""
-    good  = (delta > 0) != invert
-    cls   = "pos" if good else "neg"
-    arrow = "▲" if delta > 0 else "▼"
-    return f'<span class="delta {cls}">{arrow} {_fmt_eur(abs(delta))}</span>'
-
-
-def _kpi_card(label: str, value: float, delta: float = 0.0, invert: bool = False) -> str:
+def _kpi_card(label: str, value: float) -> str:
     return (
         f'<div class="kpi-card">'
         f'<div class="label">{label}</div>'
         f'<div class="value">{_fmt_eur(value)}</div>'
-        f'<div>{_delta_html(delta, invert)}</div>'
         f'</div>'
     )
 
@@ -139,25 +87,31 @@ def _norm_pid(val) -> str:
         return ""
 
 
-def compute_per_product_days(
+def _safe_float(val) -> float:
+    try:
+        x = float(val)
+        return 0.0 if x != x else x
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _per_pid_breakdown(
     pat_df: pd.DataFrame,
     cat_df: pd.DataFrame,
     diag_omschr_euk: str,
-    level: str,
 ) -> pd.DataFrame:
-    """
-    Compute total Aantal and behandeldagen per node label at the chosen
-    aggregation level.  Days are derived per Prod_ID (Aantal / catalogue
-    stuks_dag) and then aggregated up to the requested level — this avoids
-    losing precision when multiple Prod_IDs share a Prod_nm with different
-    stuks_dag values.
+    """Per-Prod_ID days + financiën, exact dezelfde rekenwijze als de KPI.
 
-    Returns a DataFrame with columns: label, aantal, days, sorted by days desc.
+    Aggregaties op een hoger niveau (medicijn / groep) zijn vervolgens
+    simpele sommen van deze kolommen — daardoor matcht Σ-bars altijd de KPI.
     """
+    empty_cols = [
+        "pid_norm", "prod_nm", "med_nm", "group_nm",
+        "aantal", "days", "uitgaven", "vergoeding", "marge", "has_rates",
+    ]
     if pat_df.empty or cat_df.empty:
-        return pd.DataFrame(columns=["label", "aantal", "days"])
+        return pd.DataFrame(columns=empty_cols)
 
-    # Sum Aantal per Prod_ID, capture grouping labels
     pat = pat_df.copy()
     pat["pid_norm"] = pat["Prod_ID"].apply(_norm_pid)
     grouped = pat.groupby("pid_norm").agg(
@@ -167,7 +121,6 @@ def compute_per_product_days(
         group_nm=("Group_nm", "first"),
     ).reset_index()
 
-    # Catalogue lookup, scoped to this diagnosis when possible
     cat = cat_df.copy()
     cat["prod_id"] = cat["prod_id"].astype(str).str.strip()
     if "diag_omschr_euk" in cat.columns:
@@ -176,41 +129,167 @@ def compute_per_product_days(
             cat = cat_diag
     cat_lup = cat.drop_duplicates("prod_id").set_index("prod_id")
 
-    # Compute days per prod_id; drop rows where stuks_dag is unknown/zero
-    def _days(row) -> float | None:
+    days_col, uitg_col, verg_col, marge_col, hr_col = [], [], [], [], []
+    for _, row in grouped.iterrows():
         pid = row["pid_norm"]
         if not pid or pid not in cat_lup.index:
-            return None
-        std_raw = cat_lup.loc[pid].get("stuks_dag", 0)
-        try:
-            std = float(std_raw)
-        except (TypeError, ValueError):
-            return None
-        if std <= 0 or std != std:  # NaN or non-positive
-            return None
-        return float(row["aantal"]) / std
+            days_col.append(None)
+            uitg_col.append(0.0); verg_col.append(0.0); marge_col.append(0.0)
+            hr_col.append(False)
+            continue
+        cat_row = cat_lup.loc[pid]
+        if isinstance(cat_row, pd.DataFrame):
+            cat_row = cat_row.iloc[0]
+        std = _safe_float(cat_row.get("stuks_dag", 0))
+        if std <= 0:
+            days_col.append(None)
+            uitg_col.append(0.0); verg_col.append(0.0); marge_col.append(0.0)
+            hr_col.append(False)
+            continue
+        d = float(row["aantal"]) / std
+        prijs = _safe_float(cat_row.get("prijs_dag",      0))
+        verg  = _safe_float(cat_row.get("vergoeding_dag", 0))
+        mrg   = _safe_float(cat_row.get("margin_dag",     0))
+        days_col.append(d)
+        uitg_col.append(d * prijs)
+        verg_col.append(d * verg)
+        marge_col.append(d * mrg)
+        hr_col.append((prijs != 0.0) or (verg != 0.0) or (mrg != 0.0))
 
-    grouped["days"] = grouped.apply(_days, axis=1)
-    grouped = grouped.dropna(subset=["days"])
-    if grouped.empty:
-        return pd.DataFrame(columns=["label", "aantal", "days"])
+    grouped["days"]       = days_col
+    grouped["uitgaven"]   = uitg_col
+    grouped["vergoeding"] = verg_col
+    grouped["marge"]      = marge_col
+    grouped["has_rates"]  = hr_col
+    return grouped.dropna(subset=["days"]).reset_index(drop=True)
 
-    # Roll up to the chosen level
-    label_col = {
-        "prod_id":       "pid_norm",
-        "prod_nm":       "prod_nm",
-        "medicine_name": "med_nm",
-        "group_name":    "group_nm",
-    }.get(level, "prod_nm")
 
-    out = (
-        grouped.groupby(label_col)
-        .agg(aantal=("aantal", "sum"), days=("days", "sum"))
-        .reset_index()
-        .rename(columns={label_col: "label"})
+def _label_columns(level: str) -> tuple[str, str]:
+    """Return (groupby column for patient data, fallback used as label)."""
+    return {
+        "prod_id":       ("pid_norm", "pid_norm"),
+        "prod_nm":       ("prod_nm",  "prod_nm"),
+        "medicine_name": ("med_nm",   "med_nm"),
+        "group_name":    ("group_nm", "group_nm"),
+    }.get(level, ("prod_nm", "prod_nm"))
+
+
+def _attach_prod_id_label(out: pd.DataFrame) -> pd.DataFrame:
+    """Voor prod_id-niveau: omschrijving + (Prod_ID) als label."""
+    out = out.copy()
+    out["prod_id"] = out["prod_id"].astype(str).str.strip().replace("", "?")
+    omschr_map = load_prod_omschr_lookup()
+    prod_nm_clean = (
+        out["prod_nm"].astype(str).str.strip().replace({"": "?", "nan": "?"})
     )
-    out["label"] = out["label"].astype(str).str.strip().replace("", "?")
+    omschr_series = out["prod_id"].map(omschr_map).fillna("")
+    omschr_series = omschr_series.where(omschr_series.str.strip() != "", prod_nm_clean)
+    out["label"] = omschr_series.astype(str).str.strip() + " (" + out["prod_id"] + ")"
+    return out
+
+
+def compute_per_product_days(
+    pat_df: pd.DataFrame,
+    cat_df: pd.DataFrame,
+    diag_omschr_euk: str,
+    level: str,
+) -> pd.DataFrame:
+    """
+    Behandeldagen per productlabel op het gekozen aggregatieniveau.
+
+    Days worden per Prod_ID afgeleid (Aantal / catalogus stuks_dag) en daarna
+    geaggregeerd naar het gekozen niveau.
+    """
+    pid_df = _per_pid_breakdown(pat_df, cat_df, diag_omschr_euk)
+    if pid_df.empty:
+        return pd.DataFrame(columns=["label", "prod_id", "aantal", "days"])
+
+    if level == "prod_id":
+        out = (
+            pid_df.groupby("pid_norm")
+            .agg(aantal=("aantal", "sum"),
+                 days=("days", "sum"),
+                 prod_nm=("prod_nm", "first"))
+            .reset_index()
+            .rename(columns={"pid_norm": "prod_id"})
+        )
+        out = _attach_prod_id_label(out).drop(columns=["prod_nm"])
+    else:
+        group_col, _ = _label_columns(level)
+        out = (
+            pid_df.groupby(group_col)
+            .agg(aantal=("aantal", "sum"), days=("days", "sum"),
+                 prod_id=("pid_norm", "first"))
+            .reset_index()
+            .rename(columns={group_col: "label"})
+        )
+        out["label"] = out["label"].astype(str).str.strip().replace("", "?")
     return out.sort_values("days", ascending=False).reset_index(drop=True)
+
+
+def per_product_financials(
+    pat_df: pd.DataFrame,
+    cat_df: pd.DataFrame,
+    diag_omschr_euk: str,
+    level: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Uitgaven / vergoeding / marge per productlabel.
+
+    Berekent eerst per Prod_ID (zelfde formule als de KPI) en sommeert daarna
+    naar het gekozen niveau, zodat Σ-bars exact gelijk is aan de KPI-totalen.
+
+    Returns: (fin_df, missing_rate_labels) — labels met behandeldagen > 0 maar
+    zonder bekende tarieven (catalogusgat).
+    """
+    empty_cols = ["Product", "Aantal", "Behandeldagen", "Uitgaven (€)", "Vergoeding (€)", "Marge (€)"]
+    pid_df = _per_pid_breakdown(pat_df, cat_df, diag_omschr_euk)
+    if pid_df.empty:
+        return pd.DataFrame(columns=empty_cols), []
+
+    if level == "prod_id":
+        agg = (
+            pid_df.groupby("pid_norm")
+            .agg(aantal=("aantal", "sum"),
+                 days=("days", "sum"),
+                 uitgaven=("uitgaven", "sum"),
+                 vergoeding=("vergoeding", "sum"),
+                 marge=("marge", "sum"),
+                 has_rates=("has_rates", "max"),
+                 prod_nm=("prod_nm", "first"))
+            .reset_index()
+            .rename(columns={"pid_norm": "prod_id"})
+        )
+        agg = _attach_prod_id_label(agg)
+    else:
+        group_col, _ = _label_columns(level)
+        agg = (
+            pid_df.groupby(group_col)
+            .agg(aantal=("aantal", "sum"),
+                 days=("days", "sum"),
+                 uitgaven=("uitgaven", "sum"),
+                 vergoeding=("vergoeding", "sum"),
+                 marge=("marge", "sum"),
+                 has_rates=("has_rates", "max"))
+            .reset_index()
+            .rename(columns={group_col: "label"})
+        )
+        agg["label"] = agg["label"].astype(str).str.strip().replace("", "?")
+
+    missing = [
+        str(r["label"])
+        for _, r in agg.iterrows()
+        if float(r["days"]) > 0 and not bool(r["has_rates"])
+    ]
+
+    out = pd.DataFrame({
+        "Product":        agg["label"].astype(str),
+        "Aantal":         agg["aantal"].astype(float),
+        "Behandeldagen":  agg["days"].astype(float).round(1),
+        "Uitgaven (€)":   agg["uitgaven"].astype(float),
+        "Vergoeding (€)": agg["vergoeding"].astype(float),
+        "Marge (€)":      agg["marge"].astype(float),
+    })
+    return out.sort_values("Marge (€)", ascending=False).reset_index(drop=True), missing
 
 
 # ---------------------------------------------------------------------------
@@ -221,78 +300,22 @@ cache_df     = load_patient_cache()
 catalogue_df = load_catalogue_csv()
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar (shared) + Sankey regeneration
 # ---------------------------------------------------------------------------
 
+state = render_sidebar(cache_df)
+if state is None:
+    st.stop()
+
+selected_diag = state["selected_diag"]
+regen_start   = state["regen_start"]
+regen_end     = state["regen_end"]
+regen_vrs     = state["regen_vrs"]
+diag_idx      = state["diag_idx"]
+is_all_diag   = selected_diag == ALL_DIAGNOSES
+
+# Page-specific level selector lives below the shared sidebar
 with st.sidebar:
-    st.markdown("## ⚗️ Sankey-Ideas")
-    st.markdown("---")
-
-    # ── No data yet ─────────────────────────────────────────────────────────
-    if cache_df.empty:
-        st.warning("Geen patiëntendata gevonden.")
-        st.page_link("pages/Upload.py", label="📂 Ga naar Upload", icon="📂")
-        st.stop()
-
-    # ── Diagnose ─────────────────────────────────────────────────────────────
-    diagnoses = sorted(cache_df["Diag_omschr_EUK"].dropna().unique().tolist())
-    if not diagnoses:
-        st.warning("Geen diagnoses gevonden in patiëntendata.")
-        st.stop()
-
-    prev_diag   = st.session_state.get("selected_diag", diagnoses[0])
-    default_idx = diagnoses.index(prev_diag) if prev_diag in diagnoses else 0
-    selected_diag: str = st.selectbox("Diagnose", diagnoses, index=default_idx, key="diag_sel")
-
-    # Reset all per-diagnosis state when diagnosis changes
-    if selected_diag != st.session_state.get("selected_diag"):
-        st.session_state["selected_diag"] = selected_diag
-        st.session_state["selected_node"] = None
-        st.session_state["selected_link"] = None
-        st.session_state["kpi_baseline"]  = None
-        st.session_state["_filter_key"]   = None
-        # Clear per-diagnosis voorschrijver key (options differ per diagnosis);
-        # dates are global and intentionally preserved across diagnosis switches.
-        diag_idx_old = st.session_state.get("_diag_idx", -1)
-        st.session_state.pop(f"regen_vrs_{diag_idx_old}", None)
-
-    diag_idx = diagnoses.index(selected_diag)
-    st.session_state["_diag_idx"] = diag_idx
-
-    # ── Date range + voorschrijver ────────────────────────────────────────────
-    diag_df = cache_df[cache_df["Diag_omschr_EUK"].astype(str) == selected_diag]
-
-    # Global date defaults — initialised once from overall cache range so they
-    # persist when the user switches between diagnoses.
-    if "regen_start_date" not in st.session_state:
-        st.session_state["regen_start_date"] = (
-            cache_df["Datum"].min().date()
-            if "Datum" in cache_df.columns and not cache_df.empty else None
-        )
-    if "regen_end_date" not in st.session_state:
-        st.session_state["regen_end_date"] = (
-            cache_df["Datum"].max().date()
-            if "Datum" in cache_df.columns and not cache_df.empty else None
-        )
-
-    st.markdown("---")
-
-    sd_col, ed_col = st.columns(2)
-    with sd_col:
-        regen_start = st.date_input("Start", key="regen_start_date")
-    with ed_col:
-        regen_end = st.date_input("Eind", key="regen_end_date")
-
-    vrs_opts = ["Alle voorschrijvers"]
-    if "Voorschrijver_nm" in diag_df.columns:
-        vrs_opts += sorted(diag_df["Voorschrijver_nm"].dropna().unique().tolist())
-    regen_vrs: str = st.selectbox(
-        "Voorschrijver", vrs_opts,
-        key=f"regen_vrs_{diag_idx}",
-    )
-
-    # ── Weergaveniveau ───────────────────────────────────────────────────────
-    st.markdown("---")
     _level_pairs   = sorted(LEVEL_LABELS.items(), key=lambda x: x[1])
     level_keys     = [k for k, _ in _level_pairs]
     level_names    = [v for _, v in _level_pairs]
@@ -305,160 +328,74 @@ with st.sidebar:
         st.session_state["selected_node"] = None
         st.session_state["selected_link"] = None
 
-    st.markdown("---")
+level = st.session_state.get("level", "medicine_name")
 
-    if st.button("↺ Herstel origineel", use_container_width=True):
-        reset_edited_for_diagnosis(selected_diag)
-        st.session_state.update({"selected_node": None, "selected_link": None,
-                                  "kpi_baseline": None})
-        st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Auto-compute Sankey when filter state changes
-# ---------------------------------------------------------------------------
-
-filter_key = (selected_diag, str(regen_start), str(regen_end), regen_vrs)
-
-if st.session_state.get("_filter_key") != filter_key:
-    with st.spinner("Sankey berekenen …"):
-        generate_sankey_csv(
-            pat_df=cache_df,
-            diag_omschr_euk=selected_diag,
-            start_date=regen_start,
-            end_date=regen_end,
-            voorschrijver_nm=regen_vrs,
-            append=True,
-        )
-    st.session_state["_filter_key"]  = filter_key
-    st.session_state["kpi_baseline"] = None
-    st.session_state["selected_node"] = None
-    st.session_state["selected_link"] = None
+if not is_all_diag:
+    ensure_sankey_current(
+        cache_df, selected_diag, regen_start, regen_end, regen_vrs, grain=level,
+    )
 
 # ---------------------------------------------------------------------------
 # Load computed flows
 # ---------------------------------------------------------------------------
 
-level         = st.session_state.get("level", "medicine_name")
-selected_diag = st.session_state.get("selected_diag", diagnoses[0])
+if is_all_diag:
+    flows_agg = pd.DataFrame()
+else:
+    all_flows  = load_sankey_csv(edited=True, grain=level)
+    flows_diag = all_flows[all_flows["diag_omschr_euk"] == selected_diag].copy()
+    flows_agg  = aggregate_flows(flows_diag, level)
 
-all_flows  = load_sankey_csv(edited=True)
-flows_diag = all_flows[all_flows["diag_omschr_euk"] == selected_diag].copy()
+# ── Records-in-window for KPI + per-product totals (item 1, 3) ─────────────
+records_window = filter_records_in_window(
+    cache_df, selected_diag, regen_start, regen_end, regen_vrs
+)
 
-orig_flows = load_sankey_csv(edited=False)
-orig_diag  = orig_flows[orig_flows["diag_omschr_euk"] == selected_diag].copy()
-
-flows_agg = aggregate_flows(flows_diag, level)
-orig_agg  = aggregate_flows(orig_diag,  level)
-
-# ── Filter patient data to the current sidebar selection ─────────────────
-# Uses the SAME patient-selection logic as the Sankey generator
-# (_apply_diag_voorschrijver_time_filter): select patients whose first-ever
-# record falls within [regen_start, regen_end] AND who have the selected
-# diagnosis AND voorschrijver, then return ALL records for those patients.
-# Filtering individual records by date (as was done before) produced a far
-# larger dataset than the Sankey uses and caused KPI/Sankey mismatches.
-def _filter_patients(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty or "Pat_id" not in df.columns:
-        return df.copy()
-
-    # 1. Patients who have this diagnosis (at any date)
-    if "Diag_omschr_EUK" in df.columns:
-        pat_with_diag = set(
-            df[df["Diag_omschr_EUK"].astype(str) == selected_diag]["Pat_id"].unique()
-        )
-    else:
-        pat_with_diag = set(df["Pat_id"].unique())
-
-    # 2. Patients whose very first record is within [regen_start, regen_end]
-    #    (mirrors Start_Datum_pat logic in _apply_diag_voorschrijver_time_filter)
-    if "Datum" in df.columns:
-        start_ts = pd.Timestamp(regen_start)
-        end_ts   = pd.Timestamp(regen_end)
-        first_date = df.groupby("Pat_id")["Datum"].min()
-        pat_in_range = set(
-            first_date[(first_date >= start_ts) & (first_date <= end_ts)].index
-        )
-    else:
-        pat_in_range = set(df["Pat_id"].unique())
-
-    # 3. Patients with the selected voorschrijver (if filter active)
-    if regen_vrs != "Alle voorschrijvers" and "Voorschrijver_nm" in df.columns:
-        pat_with_vrs = set(
-            df[df["Voorschrijver_nm"].astype(str) == regen_vrs]["Pat_id"].unique()
-        )
-    else:
-        pat_with_vrs = set(df["Pat_id"].unique())
-
-    qualifying = pat_with_diag & pat_in_range & pat_with_vrs
-    return df[df["Pat_id"].isin(qualifying)].copy()
-
-
-pat_filtered = _filter_patients(cache_df)
-
-# KPI baseline: all patients with this diagnosis whose first-ever record falls
-# within the full cache date range (same patient-selection principle, no extra filter).
-if st.session_state.get("kpi_baseline") is None:
-    if "Diag_omschr_EUK" in cache_df.columns and "Pat_id" in cache_df.columns:
-        pat_with_diag_all = set(
-            cache_df[cache_df["Diag_omschr_EUK"].astype(str) == selected_diag]["Pat_id"].unique()
-        )
-        pat_baseline = cache_df[cache_df["Pat_id"].isin(pat_with_diag_all)].copy()
-    else:
-        pat_baseline = cache_df.copy()
-    st.session_state["kpi_baseline"] = compute_kpis_from_patients(
-        pat_baseline, catalogue_df, selected_diag, filter_to_diag=False
-    )
-
-baseline       = st.session_state["kpi_baseline"]
-current_totals = compute_kpis_from_patients(pat_filtered, catalogue_df, selected_diag, filter_to_diag=False)
+current_totals = compute_kpis_from_patients(
+    records_window, catalogue_df, selected_diag, filter_to_diag=False
+)
 
 # ---------------------------------------------------------------------------
-# KPI bar
+# KPI bar — totalen voor ALLE behandeling in het venster
 # ---------------------------------------------------------------------------
 
-# Build subtitle: active filter summary
 vrs_label = regen_vrs if regen_vrs != "Alle voorschrijvers" else "alle voorschrijvers"
 st.markdown(
     f"### 📊 Financieel overzicht — {selected_diag}  "
-    f"<small style='font-weight:400;color:#64748B;'>  {regen_start} → {regen_end} · {vrs_label}</small>",
+    f"<small style='font-weight:400;color:#64748B;'>  "
+    f"alle behandeling in {regen_start} → {regen_end} · {vrs_label}</small>",
     unsafe_allow_html=True,
 )
 
 kc1, kc2, kc3 = st.columns(3)
 with kc1:
-    st.markdown(_kpi_card("Vergoeding / jaar", current_totals["vergoeding"],
-                           current_totals["vergoeding"] - baseline["vergoeding"]),
+    st.markdown(_kpi_card("Vergoeding", current_totals["vergoeding"]),
                 unsafe_allow_html=True)
 with kc2:
-    st.markdown(_kpi_card("Uitgaven / jaar", current_totals["uitgaven"],
-                           current_totals["uitgaven"] - baseline["uitgaven"], invert=True),
+    st.markdown(_kpi_card("Uitgaven", current_totals["uitgaven"]),
                 unsafe_allow_html=True)
 with kc3:
-    st.markdown(_kpi_card("Marge / jaar", current_totals["marge"],
-                           current_totals["marge"] - baseline["marge"]),
+    st.markdown(_kpi_card("Marge", current_totals["marge"]),
                 unsafe_allow_html=True)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Two-column layout
+# Sankey — NIEUWE patiënten (alleen voor één diagnose)
 # ---------------------------------------------------------------------------
 
-col_sankey, col_panel = st.columns([3, 2], gap="large")
-
-# ════════════════════════════════════════════════════════════════════════════
-# LEFT: Sankey
-# ════════════════════════════════════════════════════════════════════════════
-with col_sankey:
+if not is_all_diag:
     level_display = LEVEL_LABELS.get(level, level)
-    st.markdown(f'<div class="section-header">Patiëntenstroom ({level_display})</div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="section-header">🔄 Stroom van NIEUWE patiënten in de geselecteerde periode</div>'
+        f'<small style="color:#64748B;">{regen_start} → {regen_end} · niveau: {level_display}</small>',
+        unsafe_allow_html=True,
+    )
 
     fig = build_sankey_from_csv(
         flows_df=flows_agg,
         level=level,
-        selected_node=st.session_state.get("selected_node"),
+        selected_node=None,
         selected_link=st.session_state.get("selected_link"),
         diag_omschr_euk=selected_diag,
     )
@@ -466,14 +403,13 @@ with col_sankey:
     event = st.plotly_chart(fig, use_container_width=True, on_select="rerun",
                             key="sankey_chart")
 
-    # ── Parse click event ────────────────────────────────────────────────
+    # Parse click event — link clicks open the flow-adjustment panel
     if event and hasattr(event, "selection"):
         sel    = event.selection
         points = sel.get("points", []) if isinstance(sel, dict) else getattr(sel, "points", [])
         if points:
             pt = points[0]
             cd = pt.get("customdata") if isinstance(pt, dict) else getattr(pt, "customdata", None)
-            # Link click: customdata[0] = "src||src_layer||tgt||tgt_layer||level"
             if isinstance(cd, (list, tuple)) and len(cd) >= 1 and "||" in str(cd[0]):
                 parts = str(cd[0]).split("||")
                 if len(parts) == 5:
@@ -482,26 +418,14 @@ with col_sankey:
                     if new_link != st.session_state.get("selected_link"):
                         st.session_state["selected_link"]       = new_link
                         st.session_state["selected_link_level"] = link_level
-                        st.session_state["selected_node"]       = None
                         st.rerun()
-            else:
-                # Node click
-                lbl = pt.get("label") if isinstance(pt, dict) else getattr(pt, "label", None)
-                if not lbl:
-                    lbl = (pt.get("pointLabel") if isinstance(pt, dict)
-                           else getattr(pt, "pointLabel", None))
-                if lbl and lbl != st.session_state.get("selected_node"):
-                    st.session_state["selected_node"] = lbl
-                    st.session_state["selected_link"] = None
-                    st.rerun()
 
     st.markdown(
-        '<div class="info-box">Klik op een <b>flow</b> om behandeldagen aan te passen. '
-        'Klik op een <b>node</b> om alternatieven te vergelijken.</div>',
+        '<div class="info-box">Klik op een <b>flow</b> om behandeldagen aan te passen.</div>',
         unsafe_allow_html=True,
     )
 
-    # ── Flow adjustment panel ────────────────────────────────────────────
+    # ── Flow adjustment panel ──────────────────────────────────────────────
     sel_link  = st.session_state.get("selected_link")
     sel_level = st.session_state.get("selected_link_level", level)
 
@@ -541,302 +465,189 @@ with col_sankey:
                     st.session_state["selected_link"] = None
                     st.rerun()
 
-    # ── Flows table ──────────────────────────────────────────────────────
-    with st.expander("Alle flows (huidige weergave)", expanded=False):
-        show_cols = [c for c in [
-            "source_label", "source_layer", "target_label", "target_layer",
-            "pat_count", "sum_aantal", "gem_aantal_per_pat",
-            "stuks_dag", "days_treated", "days_per_pat",
-            "heritage",
-        ] if c in flows_agg.columns]
-        disp = flows_agg[show_cols].copy()
-        disp.columns = [c.replace("_", " ").title() for c in show_cols]
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-
-    # ── Fallback node selector ───────────────────────────────────────────
-    with st.expander("Of selecteer een node via dropdown", expanded=False):
-        all_node_labels = sorted(
-            set(flows_agg["target_label"].tolist() + flows_agg["source_label"].tolist())
-            - {"Source"}
-        )
-        sel_fb = st.selectbox("Node", ["— selecteer —"] + all_node_labels,
-                              key="fallback_node_sel")
-        if sel_fb != "— selecteer —":
-            if st.button("Toon alternatieven", key="fallback_btn"):
-                st.session_state["selected_node"] = sel_fb
-                st.session_state["selected_link"] = None
-                st.rerun()
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# RIGHT: Behandeldagen-per-product chart + Product alternatives
-# ════════════════════════════════════════════════════════════════════════════
-with col_panel:
-    # ── Bar chart: total behandeldagen per product (ground-truth method) ──
-    st.markdown('<div class="section-header">Behandeldagen per product</div>',
-                unsafe_allow_html=True)
-
-    days_df = compute_per_product_days(pat_filtered, catalogue_df, selected_diag, level)
-    if days_df.empty:
-        st.info("Geen producten met bekende stuks/dag voor de huidige filter.")
-    else:
-        bar_df = days_df.head(20).copy()
-        bar_df = bar_df.sort_values("days", ascending=True)  # asc → top of bar = highest
-        fig_bar = px.bar(
-            bar_df,
-            x="days",
-            y="label",
-            orientation="h",
-            text=bar_df["days"].round(0),
-            labels={"days": "Behandeldagen", "label": ""},
-            height=max(260, 28 * len(bar_df) + 80),
-            hover_data={"aantal": ":,.1f", "days": ":,.1f"},
-        )
-        fig_bar.update_traces(
-            marker_color="#29B5E8",
-            texttemplate="%{x:,.0f}",
-            textposition="outside",
-            cliponaxis=False,
-        )
-        fig_bar.update_layout(
-            margin=dict(l=10, r=70, t=10, b=10),
-            paper_bgcolor="#F6F8FA",
-            plot_bgcolor="white",
-            showlegend=False,
-            xaxis=dict(showgrid=True, gridcolor="#E5E7EB"),
-            yaxis=dict(showgrid=False),
-            font=dict(size=11, family="Inter, sans-serif"),
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
-        st.caption(
-            f"Som van Aantal × (1 / stuks-per-dag) per {LEVEL_LABELS.get(level, level)}, "
-            "berekend uit alle records van de geselecteerde patiënten."
-        )
-
-    st.markdown("---")
-
-    # ── Product alternatives panel ───────────────────────────────────────
-    sel_node = st.session_state.get("selected_node")
-
-    if not sel_node:
-        st.markdown('<div class="section-header">Productenvergelijking</div>',
-                    unsafe_allow_html=True)
-        st.markdown(
-            '<div class="info-box" style="margin-top:8px;">'
-            'Klik op een node in het Sankey-diagram om alternatieven te vergelijken.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(f'<div class="section-header">Vergelijking: {sel_node}</div>',
-                    unsafe_allow_html=True)
-
-        if catalogue_df.empty:
-            st.warning("product_diagnosis_catalogue.csv is leeg of niet gevonden.")
-        else:
-            # Filter catalogue to the selected diagnosis using the numeric diag_id_euk
-            cat = catalogue_df.copy()
-            flow_diag_id = ""
-            if "diag_id_euk" in flows_diag.columns:
-                ids = flows_diag["diag_id_euk"].dropna().replace("", float("nan")).dropna().unique()
-                if len(ids) > 0:
-                    flow_diag_id = str(ids[0]).strip()
-            if flow_diag_id and "diag_id_euk" in cat.columns:
-                cat_diag = cat[cat["diag_id_euk"].astype(str).str.strip() == flow_diag_id]
-                if not cat_diag.empty:
-                    cat = cat_diag
-
-            nm_lower = sel_node.lower().strip()
-
-            # At prod_id level labels are "Prod_omschr (prod_id)" — extract the raw id
-            lookup_key = nm_lower
-            if level == "prod_id" and "(" in nm_lower and nm_lower.rstrip().endswith(")"):
-                lookup_key = nm_lower.rsplit("(", 1)[1].rstrip(")").strip()
-
-            level_to_cat_col = {
-                "prod_id":       "prod_id",
-                "prod_nm":       "prod_nm",
-                "medicine_name": "medicine_name",
-                "group_name":    "group_name",
-            }
-            match_col = level_to_cat_col.get(level, "prod_nm")
-            if match_col in cat.columns:
-                cur_match = cat[cat[match_col].astype(str).str.lower().str.strip() == lookup_key]
-            else:
-                cur_match = pd.DataFrame()
-
-            if cur_match.empty:
-                for fb_col in ["prod_nm", "medicine_name"]:
-                    if fb_col in cat.columns:
-                        cur_match = cat[cat[fb_col].astype(str).str.lower().str.strip() == lookup_key]
-                        if not cur_match.empty:
-                            break
-
-            cur_row = cur_match.iloc[0] if not cur_match.empty else None
-            cur_pid = str(cur_row["prod_id"])      if cur_row is not None else None
-            cur_grp = str(cur_row["group_name"])   if cur_row is not None else None
-            cur_did = str(cur_row.get("diag_id_euk", "")) if cur_row is not None else ""
-            cur_md  = float(cur_row.get("margin_dag",     0) or 0) if cur_row is not None else 0.0
-            cur_ud  = float(cur_row.get("prijs_dag",      0) or 0) if cur_row is not None else 0.0
-            cur_vd  = float(cur_row.get("vergoeding_dag", 0) or 0) if cur_row is not None else 0.0
-
-            if cur_row is not None:
-                mc1, mc2, mc3 = st.columns(3)
-                with mc1:
-                    st.metric("Marge/dag",    f"€ {cur_md:.4f}")
-                with mc2:
-                    st.metric("Uitgaven/dag", f"€ {cur_ud:.4f}")
-                with mc3:
-                    st.metric("Vergoed/dag",  f"€ {cur_vd:.4f}")
-            else:
-                st.info(f"'{sel_node}' niet gevonden in product_diagnosis_catalogue.csv.")
-
-            st.markdown("---")
-
-            if cur_grp and "group_name" in cat.columns:
-                alts = cat[cat["group_name"] == cur_grp].copy()
-                if cur_did and "diag_id_euk" in alts.columns:
-                    alts_diag = alts[alts["diag_id_euk"].astype(str) == cur_did]
-                    if not alts_diag.empty:
-                        alts = alts_diag
-                if cur_pid:
-                    alts = alts[alts["prod_id"].astype(str) != cur_pid]
-                alts = alts.sort_values(
-                    [c for c in ["medicine_name", "prod_nm", "admin_method"] if c in alts.columns]
-                ).reset_index(drop=True)
-            else:
-                alts = pd.DataFrame()
-
-            if alts.empty:
-                st.info("Geen alternatieven gevonden in dezelfde productgroep.")
-            else:
-                st.markdown(f"**{len(alts)} alternatieven** in groep *{cur_grp}*")
-
-                disp_cols = [c for c in [
-                    "group_name", "medicine_name", "prod_nm", "admin_method",
-                    "margin_dag", "prijs_dag", "vergoeding_dag",
-                ] if c in alts.columns]
-                alts_disp = alts[disp_cols].rename(columns={
-                    "group_name": "Groep", "medicine_name": "Medicijn",
-                    "prod_nm": "Product", "admin_method": "Toediening",
-                    "margin_dag": "Marge/dag (€)", "prijs_dag": "Uitgaven/dag (€)",
-                    "vergoeding_dag": "Vergoed/dag (€)",
-                })
-                float_cols = [c for c in ["Marge/dag (€)", "Uitgaven/dag (€)", "Vergoed/dag (€)"]
-                              if c in alts_disp.columns]
-
-                def _style_alts(df: pd.DataFrame) -> pd.DataFrame:
-                    styles = pd.DataFrame("", index=df.index, columns=df.columns)
-                    for col, ref, lb in [
-                        ("Marge/dag (€)",    cur_md, False),
-                        ("Uitgaven/dag (€)", cur_ud, True),
-                        ("Vergoed/dag (€)",  cur_vd, False),
-                    ]:
-                        if col not in df.columns or ref == 0:
-                            continue
-                        def _c(v, ref=ref, lb=lb):
-                            if lb:
-                                return ("background-color:#dcfce7;color:#16a34a;font-weight:600"
-                                        if v < ref * 0.95 else
-                                        ("background-color:#fee2e2;color:#dc2626;font-weight:600"
-                                         if v > ref * 1.05 else "background-color:#fef9c3"))
-                            else:
-                                return ("background-color:#dcfce7;color:#16a34a;font-weight:600"
-                                        if v > ref * 1.05 else
-                                        ("background-color:#fee2e2;color:#dc2626;font-weight:600"
-                                         if v < ref * 0.95 else "background-color:#fef9c3"))
-                        styles[col] = df[col].apply(_c)
-                    return styles
-
-                styled = alts_disp.style.apply(_style_alts, axis=None).format(
-                    {c: "€ {:.4f}" for c in float_cols}
-                )
-                sel_rows = st.dataframe(styled, use_container_width=True, hide_index=True,
-                                        on_select="rerun", selection_mode="single-row",
-                                        key="alts_table")
-
-                rows_idx = (sel_rows.selection.get("rows", [])
-                            if isinstance(sel_rows.selection, dict)
-                            else getattr(sel_rows.selection, "rows", []))
-
-                if rows_idx:
-                    alt_row = alts.iloc[rows_idx[0]]
-                    alt_md  = float(alt_row.get("margin_dag",     0) or 0)
-                    alt_ud  = float(alt_row.get("prijs_dag",      0) or 0)
-                    alt_vd  = float(alt_row.get("vergoeding_dag", 0) or 0)
-
-                    st.markdown("#### 💡 Idee opslaan")
-                    st.markdown(
-                        f"**Huidig:** {sel_node} &nbsp;→&nbsp; "
-                        f"**Alternatief:** {alt_row.get('prod_nm', '–')}"
-                    )
-                    ac1, ac2, ac3 = st.columns(3)
-                    with ac1:
-                        st.metric("Δ Marge/dag",    f"€ {alt_md:.4f}",
-                                  delta=f"{alt_md - cur_md:+.4f} €")
-                    with ac2:
-                        st.metric("Δ Uitgaven/dag", f"€ {alt_ud:.4f}",
-                                  delta=f"{alt_ud - cur_ud:+.4f} €", delta_color="inverse")
-                    with ac3:
-                        st.metric("Δ Vergoed/dag",  f"€ {alt_vd:.4f}",
-                                  delta=f"{alt_vd - cur_vd:+.4f} €")
-
-                    notities = st.text_area("Notities", value="", key="save_notities")
-                    reden    = st.selectbox("Reden beslissing", REDEN_OPTIONS, key="save_reden")
-
-                    if st.button("💾 Opslaan als Idee", type="primary",
-                                 use_container_width=True, key="save_idea_btn"):
-                        row_dict = {
-                            "timestamp":                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "prod_id_huidig":           str(cur_pid) if cur_pid else "",
-                            "diag_id_euk":              "",
-                            "diag_omschr_euk":          selected_diag,
-                            "group":                    cur_grp or "",
-                            "medicine_name":            str(cur_row.get("medicine_name", "")) if cur_row is not None else "",
-                            "prod_nm":                  str(cur_row.get("prod_nm", sel_node)) if cur_row is not None else sel_node,
-                            "admin_method_huidig":      str(cur_row.get("admin_method", "")) if cur_row is not None else "",
-                            "admin_method_alternatief": str(alt_row.get("admin_method", "")),
-                            "medicine_name_max":        str(alt_row.get("medicine_name", "")),
-                            "group_name_max":           str(alt_row.get("group_name", "")),
-                            "prod_nm_max":              str(alt_row.get("prod_nm", "")),
-                            "prod_id_max":              str(alt_row.get("prod_id", "")),
-                            "doen": 1, "verdere_studie": 0, "niet_doen": 0,
-                            "niveau":                   level,
-                            "notities":                 notities,
-                            "Reden_beslissing":         reden,
-                            "auto_classified":          False,
-                        }
-                        try:
-                            save_idea(row_dict)
-                            st.success(
-                                f"✅ Opgeslagen: **{sel_node}** → **{alt_row.get('prod_nm', '–')}**"
-                            )
-                        except Exception as exc:
-                            st.error(f"Fout bij opslaan: {exc}")
-
-        with st.expander("Opgeslagen ideeën (lokaal)", expanded=False):
-            fb = load_feedback()
-            if fb.empty:
-                st.info("Nog geen ideeën opgeslagen.")
-            else:
-                show_cols = [c for c in ["timestamp", "prod_nm", "prod_nm_max",
-                                         "diag_omschr_euk", "Reden_beslissing"] if c in fb.columns]
-                st.dataframe(fb[show_cols].tail(20), use_container_width=True, hide_index=True)
-
 # ---------------------------------------------------------------------------
-# CSV viewer at the bottom
+# Behandeldagen per product — alle behandeling in het venster
 # ---------------------------------------------------------------------------
 
 st.markdown("---")
-with st.expander("📋 CSV-inhoud bekijken", expanded=False):
-    tab1, tab2, tab3 = st.tabs(["sankey_original", "sankey_edited", "product_catalogue"])
-    with tab1:
-        df_o = load_sankey_csv(edited=False)
-        st.dataframe(df_o[df_o["diag_omschr_euk"] == selected_diag],
-                     use_container_width=True, hide_index=True)
-    with tab2:
-        df_e = load_sankey_csv(edited=True)
-        st.dataframe(df_e[df_e["diag_omschr_euk"] == selected_diag],
-                     use_container_width=True, hide_index=True)
-    with tab3:
-        st.dataframe(load_catalogue_csv(), use_container_width=True, hide_index=True)
+st.markdown(
+    '<div class="section-header">💊 Behandeldagen per product '
+    '— alle behandeling in de geselecteerde periode</div>',
+    unsafe_allow_html=True,
+)
+
+days_df = compute_per_product_days(records_window, catalogue_df, selected_diag, level)
+
+if days_df.empty:
+    st.info("Geen producten met bekende stuks/dag voor de huidige filter.")
+else:
+    fin_df, missing_rate_labels = per_product_financials(
+        records_window, catalogue_df, selected_diag, level
+    )
+
+    bar_df = days_df.head(20).copy().sort_values("days", ascending=True)
+    fin_chart_df = (
+        fin_df.set_index("Product")
+        .reindex(bar_df["label"].tolist())
+        .rename_axis("Product")
+        .reset_index()
+    )
+
+    product_order = bar_df["label"].tolist()
+
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_yaxes=True,
+        horizontal_spacing=0.015,
+        subplot_titles=(
+            "Behandeldagen per product",
+            "Financiën per product — uitgaven, vergoeding & marge",
+        ),
+        column_widths=[0.45, 0.55],
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=bar_df["days"],
+            y=bar_df["label"],
+            orientation="h",
+            marker_color="#29B5E8",
+            cliponaxis=False,
+            customdata=bar_df[["aantal"]].values,
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Behandeldagen: %{x:,.1f}<br>"
+                "Aantal: %{customdata[0]:,.1f}<extra></extra>"
+            ),
+            showlegend=False,
+            name="Behandeldagen",
+        ),
+        row=1,
+        col=1,
+    )
+
+    metric_colors = {
+        "Uitgaven (€)":   "#EF4444",
+        "Vergoeding (€)": "#10B981",
+        "Marge (€)":      "#29B5E8",
+    }
+    for metric, color in metric_colors.items():
+        fig.add_trace(
+            go.Bar(
+                x=fin_chart_df[metric],
+                y=fin_chart_df["Product"],
+                orientation="h",
+                marker_color=color,
+                name=metric,
+                legendgroup=metric,
+                hovertemplate=(
+                    f"<b>%{{y}}</b><br>{metric}: € %{{x:,.0f}}<extra></extra>"
+                ),
+                cliponaxis=False,
+            ),
+            row=1,
+            col=2,
+        )
+
+    fig.update_yaxes(
+        automargin=True,
+        showgrid=False,
+        categoryorder="array",
+        categoryarray=product_order,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        automargin=True,
+        showgrid=False,
+        showticklabels=False,
+        categoryorder="array",
+        categoryarray=product_order,
+        row=1,
+        col=2,
+    )
+    fig.update_xaxes(
+        title_text="Behandeldagen",
+        showgrid=True,
+        gridcolor="#E5E7EB",
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        title_text="Bedrag (€)",
+        tickprefix="€ ",
+        tickformat=",.0f",
+        showgrid=True,
+        gridcolor="#E5E7EB",
+        row=1,
+        col=2,
+    )
+
+    zebra_shapes = []
+    for idx, _label in enumerate(product_order):
+        if idx % 2 == 0:
+            continue
+        for col in (1, 2):
+            zebra_shapes.append(
+                dict(
+                    type="rect",
+                    xref=f"x{'' if col == 1 else col} domain",
+                    yref=f"y{'' if col == 1 else col}",
+                    x0=0,
+                    x1=1,
+                    y0=idx - 0.5,
+                    y1=idx + 0.5,
+                    fillcolor="#F1F5F9",
+                    line=dict(width=0),
+                    layer="below",
+                )
+            )
+
+    fig.update_layout(
+        barmode="group",
+        bargap=0.25,
+        bargroupgap=0.05,
+        margin=dict(l=20, r=40, t=70, b=60),
+        height=max(320, 32 * len(bar_df) + 120),
+        paper_bgcolor="#F6F8FA",
+        plot_bgcolor="white",
+        font=dict(size=11, family="Inter, sans-serif"),
+        shapes=zebra_shapes,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1.0,
+            bgcolor="rgba(255,255,255,0.85)",
+            title_text="",
+        ),
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        f"Behandeldagen = Som van Aantal × (1 / stuks-per-dag) per "
+        f"{LEVEL_LABELS.get(level, level)}. Financiën tonen uitgaven, vergoeding "
+        "en marge per product over het filtervenster."
+    )
+    if missing_rate_labels:
+        st.warning(
+            "Geen tarieven bekend voor: "
+            + ", ".join(missing_rate_labels)
+            + " — controleer catalogus."
+        )
+
+    st.markdown("**Financieel per product (tabel)**")
+    st.dataframe(
+        fin_df.style.format({
+            "Aantal":         "{:,.1f}",
+            "Behandeldagen":  "{:,.1f}",
+            "Uitgaven (€)":   "€ {:,.0f}",
+            "Vergoeding (€)": "€ {:,.0f}",
+            "Marge (€)":      "€ {:,.0f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+        height=max(280, 28 * min(len(fin_df), 20) + 80),
+    )
