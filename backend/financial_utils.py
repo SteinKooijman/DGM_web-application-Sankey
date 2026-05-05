@@ -56,13 +56,15 @@ def build_t1t2(t1: pd.DataFrame, t2: pd.DataFrame) -> pd.DataFrame:
     Returns a DataFrame with columns (subset of what's available):
       Prod_ID, Prod_nm, Medicine Name, Group Name, Diag_ID_EUK,
       Administration Method, Dosage Frequency, Prijs/st, Vergoeding/st
-    Adds computed: stuks_dag (1.0 when Stuks/toediening unavailable),
-                   uitgaven_dag, vergoeding_dag, margin_dag (per unit if stuks_dag==1)
+    Adds computed: Stuks/toediening (Dosage Height × multiplier / mg), stuks_dag,
+                   uitgaven_dag, vergoeding_dag, margin_dag.
     """
     t1_cols = [c for c in [
         "Medicine Name", "Group Name", "Diag_ID_EUK",
         "Administration Method", "Dosage Frequency",
+        "Dosage Height", "Dosage Type",
         "Stuks/toediening", "Freq_dosage (days)",  # present in older T1 versions
+        "Info_Dosage?", "Date edited",             # used for T1 dedup
     ] if c in t1.columns]
     t2_cols = [c for c in [
         "Prod_ID", "Prod_nm", "Prod_omschr", "Medicine Name",
@@ -70,20 +72,84 @@ def build_t1t2(t1: pd.DataFrame, t2: pd.DataFrame) -> pd.DataFrame:
     ] if c in t2.columns]
 
     t1_clean = t1[t1_cols].copy()
+
+    # Drop T1 rows with zero/missing dosing — they create NaN per-dag values and
+    # can mask the real dosing row during downstream dedup.
+    if "Dosage Height" in t1_clean.columns and "Dosage Frequency" in t1_clean.columns:
+        _dose_h = pd.to_numeric(t1_clean["Dosage Height"], errors="coerce")
+        _dose_f = pd.to_numeric(t1_clean["Dosage Frequency"], errors="coerce")
+        t1_clean = t1_clean[(_dose_h.fillna(0) > 0) & (_dose_f.fillna(0) > 0)].copy()
+
+    # Dedup T1: prefer rows where Info_Dosage? is True, then most recent Date edited.
+    # Unique key is (Medicine Name, Administration Method, Diag_ID_EUK) — one
+    # canonical dosing row per medicine + admin route + diagnosis.
+    _info_true = (
+        t1_clean["Info_Dosage?"].astype(str).str.strip().str.lower()
+        .isin(["true", "1", "yes"])
+        if "Info_Dosage?" in t1_clean.columns
+        else pd.Series(True, index=t1_clean.index)
+    )
+    _date_edited = (
+        pd.to_datetime(t1_clean["Date edited"], errors="coerce")
+        if "Date edited" in t1_clean.columns
+        else pd.Series(pd.NaT, index=t1_clean.index)
+    )
+    t1_clean = t1_clean.assign(_info_true=_info_true, _date_edited=_date_edited)
+    dedup_subset = [
+        c for c in ["Medicine Name", "Administration Method", "Diag_ID_EUK"]
+        if c in t1_clean.columns
+    ]
+    if dedup_subset:
+        t1_clean = (
+            t1_clean.sort_values(["_info_true", "_date_edited"], ascending=[False, False])
+            .drop_duplicates(subset=dedup_subset)
+        )
+    t1_clean = t1_clean.drop(columns=["_info_true", "_date_edited"])
+
     t2_clean = t2[t2_cols].drop_duplicates(subset=["Prod_ID"]).copy()
 
-    # Normalise join key: lowercase Medicine Name
-    t1_clean["_med_lower"] = t1_clean["Medicine Name"].astype(str).str.lower().str.strip()
-    t2_clean["_med_lower"] = t2_clean["Medicine Name"].astype(str).str.lower().str.strip()
+    # Composite join key: Medicine Name + Administration Method (case-insensitive).
+    # Same product can be dosed differently per admin route, so both must match.
+    def _key(df: pd.DataFrame) -> pd.Series:
+        med = df["Medicine Name"].astype(str).str.lower().str.strip()
+        adm = (
+            df["Administration Method"].astype(str).str.lower().str.strip()
+            if "Administration Method" in df.columns
+            else pd.Series("", index=df.index)
+        )
+        return med + "|" + adm
 
-    merged = pd.merge(t1_clean, t2_clean, on="_med_lower", how="inner", suffixes=("_t1", "_t2"))
-    merged = merged.drop(columns=["_med_lower"])
+    t1_clean["_key"] = _key(t1_clean)
+    t2_clean["_key"] = _key(t2_clean)
+
+    merged = pd.merge(t1_clean, t2_clean, on="_key", how="inner", suffixes=("_t1", "_t2"))
+    merged = merged.drop(columns=["_key"])
 
     # Resolve duplicate columns: prefer T2 for shared cols (Administration Method, Medicine Name)
     for col in ["Administration Method", "Medicine Name"]:
         if f"{col}_t1" in merged.columns and f"{col}_t2" in merged.columns:
             merged[col] = merged[f"{col}_t2"]
             merged = merged.drop(columns=[f"{col}_t1", f"{col}_t2"])
+
+    # Compute Stuks/toediening if missing: Dosage Height × multiplier / mg.
+    # Multiplier converts dose-per-kg or per-m² to absolute mg per administration.
+    DOSAGE_MULTIPLIERS = {"kg": 75, "m2": 1.8}
+    DOSAGE_DEFAULT = 1
+    if (
+        "Stuks/toediening" not in merged.columns
+        and "Dosage Height" in merged.columns
+        and "mg" in merged.columns
+    ):
+        dose_h = pd.to_numeric(merged["Dosage Height"], errors="coerce")
+        mg = pd.to_numeric(merged["mg"], errors="coerce")
+        if "Dosage Type" in merged.columns:
+            multiplier = (
+                merged["Dosage Type"].astype(str).str.strip()
+                .map(DOSAGE_MULTIPLIERS).fillna(DOSAGE_DEFAULT)
+            )
+        else:
+            multiplier = DOSAGE_DEFAULT
+        merged["Stuks/toediening"] = (dose_h * multiplier) / mg
 
     # Compute stuks/dag: use explicit cols if present, else default to 1.0 (per-unit comparison)
     freq_col = next((c for c in ["Freq_dosage (days)", "Dosage Frequency"] if c in merged.columns), None)
