@@ -133,7 +133,43 @@ with ctrl_c:
 
 # Resolve the diagnose-specific catalogus subset once — used by both the
 # right-side picker and the Productcatalogus block below.
+# Resolution order: design.diag_id_euk → catalogue lookup by name →
+# patient cache lookup by name (source of truth, tolerant to T4 gaps).
 diag_id = str(design.get("diag_id_euk", "") or "").strip()
+_sel_norm = str(selected_diag or "").strip().casefold()
+
+if not diag_id and _sel_norm and "diag_omschr_euk" in catalogue_df.columns:
+    _m = catalogue_df.loc[
+        catalogue_df["diag_omschr_euk"].astype(str).str.strip().str.casefold() == _sel_norm,
+        "diag_id_euk",
+    ].dropna().astype(str).str.strip()
+    if not _m.empty:
+        diag_id = _m.iloc[0]
+
+if (
+    not diag_id
+    and _sel_norm
+    and "Diag_omschr_EUK" in cache_df.columns
+    and "Diag_ID_EUK" in cache_df.columns
+):
+    _pat_ids = cache_df.loc[
+        cache_df["Diag_omschr_EUK"].astype(str).str.strip().str.casefold() == _sel_norm,
+        "Diag_ID_EUK",
+    ].dropna()
+    for _v in _pat_ids:
+        _s = str(_v).strip()
+        if not _s or _s.lower() == "nan":
+            continue
+        try:
+            diag_id = str(int(float(_s)))
+        except (TypeError, ValueError):
+            diag_id = _s
+        break
+
+if diag_id and not str(design.get("diag_id_euk", "") or "").strip():
+    design["diag_id_euk"] = diag_id
+    st.session_state[design_state_key] = design
+
 cat_for_diag = catalogue_df.copy()
 cat_for_diag["prod_id"] = cat_for_diag["prod_id"].astype(str).str.strip()
 if diag_id and "diag_id_euk" in cat_for_diag.columns:
@@ -337,15 +373,7 @@ st.markdown("---")
 st.markdown('<div class="section-header">Productcatalogus (deze diagnose)</div>',
             unsafe_allow_html=True)
 
-# Resolve diag_id: prefer the design's diag_id_euk, fall back to lookup by name.
-_cat_diag_id = str(design.get("diag_id_euk", "") or "").strip()
-if not _cat_diag_id and selected_diag and "diag_omschr_euk" in catalogue_df.columns:
-    _match = catalogue_df.loc[
-        catalogue_df["diag_omschr_euk"].astype(str).str.strip() == str(selected_diag).strip(),
-        "diag_id_euk",
-    ].dropna().astype(str).str.strip()
-    if not _match.empty:
-        _cat_diag_id = _match.iloc[0]
+_cat_diag_id = diag_id  # resolved at the top of the layout block
 
 if not _cat_diag_id:
     st.info("Geen diag_id_euk bekend voor deze diagnose; catalogus niet weergegeven.")
