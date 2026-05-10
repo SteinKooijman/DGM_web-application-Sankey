@@ -30,7 +30,7 @@ from backend.csv_builder import (
     load_patient_cache,
     save_patient_cache,
 )
-from backend.sidebar import inject_shared_css
+from backend.sidebar import inject_shared_css, render_sidebar_nav
 
 # ---------------------------------------------------------------------------
 # Page config + shared styling
@@ -100,13 +100,7 @@ def _try_load_t2() -> pd.DataFrame:
 # Sidebar nav hint
 # ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.markdown("## ⚗️ Sankey-Ideas")
-    st.markdown("---")
-    st.page_link("app.py",                   label="📊 Samenvatting",  icon="📊")
-    st.page_link("pages/2_Ontwerp.py",       label="✏️ Ontwerp",       icon="✏️")
-    st.page_link("pages/3_Implementatie.py", label="🔍 Implementatie", icon="🔍")
-    st.page_link("pages/4_Upload.py",        label="📂 Upload",        icon="📂")
+render_sidebar_nav()
 
 # ---------------------------------------------------------------------------
 # Page header

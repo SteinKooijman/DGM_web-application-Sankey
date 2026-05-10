@@ -32,7 +32,10 @@ TOOLS: list[dict] = [{
         "Per source node, the sum of share values must equal 100. "
         "Source_layer is 0 for the leftmost 'Source' node; downstream "
         "medicine layers are 1, 2, etc. Use exactly the medicine names "
-        "listed in the system prompt — do not invent new ones."
+        "listed in the system prompt — do not invent new ones. "
+        "NEVER emit a flow where `source` equals `target` (case-insensitive) "
+        "— 'patients staying on the same drug' / 'responder %' flows are "
+        "rejected; only model transitions to a DIFFERENT medicine."
     ),
     "input_schema": {
         "type": "object",
@@ -160,6 +163,16 @@ CONVENTIES:
 - Per `(source, source_layer)` moet de som van `share` exact 100 zijn.
 - Een 'flow' is een edge: {{source, source_layer, target, target_layer, share}}.
 
+VERBODEN: GEEN 'RESPONDERS'-FLOWS
+- Maak NOOIT een flow waarbij `source` en `target` hetzelfde medicijn zijn
+  (case-insensitief). 'X% blijft op medicijn A' / 'X% responders op A' is voor
+  dit ontwerp irrelevant — de apotheker is alleen geïnteresseerd in écht
+  overstappen naar een ander medicijn. Patiënten die 'blijven' op een
+  medicijn worden geen aparte flow.
+- Als de gebruiker zegt "60% reageert op medicijn A", interpreteer dat als
+  "60% komt op medicijn A te beginnen" (Source → A), NIET als een tweede
+  laag waarin A naar A blijft.
+
 BESCHIKBARE MEDICIJN-NAMEN (gebruik exact deze, niet zelf verzinnen):
 {meds_block}
 
@@ -198,6 +211,23 @@ def _apply_set_flows(design: dict, tool_input: dict) -> tuple[dict, list[str]]:
             return design, [f"Ongeldige rij in flows: {r!r} ({exc})"]
 
     new_flows = [f for f in new_flows if f["source"] and f["target"]]
+
+    # Reject self-flows (source == target, case-insensitive). 'Responder' /
+    # 'patient stays on same drug' edges are explicitly disallowed for this
+    # design — only transitions to a DIFFERENT medicine are meaningful.
+    self_loops = [
+        f for f in new_flows
+        if f["source"].strip().lower() == f["target"].strip().lower()
+    ]
+    if self_loops:
+        offenders = ", ".join(
+            f"{f['source']}→{f['target']} (laag {f['source_layer']}→{f['target_layer']})"
+            for f in self_loops
+        )
+        return design, [
+            "Self-loop flows zijn verboden (source = target). Verwijder deze "
+            f"rijen en herverdeel de aandelen over écht andere medicijnen: {offenders}"
+        ]
 
     candidate = copy.deepcopy(design)
     candidate["flows"] = new_flows

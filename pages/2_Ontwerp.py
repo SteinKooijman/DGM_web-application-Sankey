@@ -8,6 +8,7 @@ geeft de Implementatie-pagina concrete prijs/vergoeding/marge per dag.
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 
@@ -17,10 +18,13 @@ from streamlit_float import float_init
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.budget_impact import compute_budget_impact
 from backend.chat_llm import chat_turn, is_configured
 from backend.csv_builder import load_catalogue_csv, load_patient_cache, load_sankey_csv
 from backend.design_io import (
     design_to_flows_df,
+    diff_designs,
+    latest_design_for,
     list_designs,
     load_design,
     prefill_from_data_sankey,
@@ -68,10 +72,12 @@ ensure_sankey_current(
 # Initialise / load design state
 # ---------------------------------------------------------------------------
 
-design_state_key = "design_state"
-loaded_diag_key  = "design_state_diag"
+design_state_key   = "design_state"
+loaded_diag_key    = "design_state_diag"
+baseline_state_key = "design_baseline"
 
-def _seed_default_design() -> dict:
+def _seed_from_data() -> dict:
+    """Build a fresh design from the current data Sankey (fallback)."""
     flows_df = load_sankey_csv(edited=True, grain="medicine_name")
     flows_df = flows_df[flows_df["diag_omschr_euk"] == selected_diag]
     agg = aggregate_flows(flows_df, level="medicine_name")
@@ -80,16 +86,34 @@ def _seed_default_design() -> dict:
     )
     return prefill_from_data_sankey(agg, pat_window, selected_diag)
 
+
+def _initial_seed() -> tuple[dict, dict | None]:
+    """
+    Prefer the latest saved design for this diagnosis. Fall back to seeding
+    from the data Sankey when no saved design exists.
+
+    Returns (editable_design, baseline_or_None). Baseline is None when there
+    is no saved design — that suppresses the comparison UI until first save.
+    """
+    saved = latest_design_for(selected_diag)
+    if saved is not None:
+        return copy.deepcopy(saved), copy.deepcopy(saved)
+    return _seed_from_data(), None
+
+
 if (
     st.session_state.get(design_state_key) is None
     or st.session_state.get(loaded_diag_key) != selected_diag
 ):
-    st.session_state[design_state_key] = _seed_default_design()
-    st.session_state[loaded_diag_key]  = selected_diag
+    seed, baseline_seed = _initial_seed()
+    st.session_state[design_state_key]    = seed
+    st.session_state[baseline_state_key]  = baseline_seed
+    st.session_state[loaded_diag_key]     = selected_diag
     # Reset chat history when the user switches diagnosis — context changes.
     st.session_state["chat_messages"] = []
 
-design: dict = st.session_state[design_state_key]
+design: dict           = st.session_state[design_state_key]
+design_baseline: dict | None = st.session_state.get(baseline_state_key)
 
 # ---------------------------------------------------------------------------
 # Page header
@@ -104,7 +128,9 @@ st.markdown(
 ctrl_a, ctrl_b, ctrl_c = st.columns([1, 1, 2])
 with ctrl_a:
     if st.button("↺ Vul vanuit data", use_container_width=True):
-        st.session_state[design_state_key] = _seed_default_design()
+        # Resets *current edits* to the data Sankey; baseline stays — the
+        # diff will then visualise how data Sankey differs from the saved plan.
+        st.session_state[design_state_key] = _seed_from_data()
         st.rerun()
 with ctrl_b:
     if st.button("🗑 Leeg ontwerp", use_container_width=True):
@@ -123,8 +149,101 @@ with ctrl_c:
         if sel != opts[0]:
             chosen = next(d for d in saved_designs if d["filename"] == sel)
             if st.button("Laad gekozen ontwerp", key="load_design_btn"):
-                st.session_state[design_state_key] = load_design(chosen["path"])
+                loaded = load_design(chosen["path"])
+                # Loading an explicit saved design promotes it to the baseline:
+                # comparison resets to "no changes" and edits diff against it.
+                st.session_state[design_state_key]   = copy.deepcopy(loaded)
+                st.session_state[baseline_state_key] = copy.deepcopy(loaded)
                 st.rerun()
+
+# ════════════════════════════════════════════════════════════════════════════
+# Year-1 budget-impact KPIs — newly made design vs. actual; coloured by
+# how that compares to the saved baseline design's impact vs. actual.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fmt_eur(val: float) -> str:
+    if abs(val) >= 1_000_000:
+        return f"€ {val/1_000_000:,.2f}M"
+    return f"€ {val:,.0f}"
+
+
+def _render_kpi_card(label: str, cur: float, base: float, lower_is_better: bool) -> str:
+    delta = cur - base
+    pct   = (delta / base * 100.0) if abs(base) > 1e-9 else 0.0
+    if abs(delta) < 0.5:
+        delta_html = '<div class="delta">— gelijk aan opgeslagen ontwerp</div>'
+    else:
+        improving = (delta < 0) if lower_is_better else (delta > 0)
+        cls   = "pos" if improving else "neg"
+        arrow = "↓" if delta < 0 else "↑"
+        delta_html = (
+            f'<div class="delta {cls}">{arrow} {_fmt_eur(delta)} '
+            f'({pct:+.1f}%) vs opgeslagen</div>'
+        )
+    return (
+        '<div class="kpi-card">'
+        f'<div class="label">{label}</div>'
+        f'<div class="value">{_fmt_eur(cur)}</div>'
+        f'{delta_html}'
+        '</div>'
+    )
+
+
+if design_baseline is None:
+    st.markdown(
+        '<div class="info-box">Nog geen opgeslagen ontwerp — sla eerst op om '
+        'vergelijking te activeren.</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    _data_flows_all = load_sankey_csv(edited=True, grain="medicine_name")
+    _data_flows_diag = _data_flows_all[_data_flows_all["diag_omschr_euk"] == selected_diag]
+    _data_agg = aggregate_flows(_data_flows_diag, level="medicine_name")
+    _pat_window = filter_records_in_window(
+        cache_df, selected_diag, regen_start, regen_end, regen_vrs
+    )
+
+    _imp_cur  = compute_budget_impact(design,          _data_agg, _pat_window, catalogue_df)
+    _imp_base = compute_budget_impact(design_baseline, _data_agg, _pat_window, catalogue_df)
+
+    if _imp_cur["baseline_starter_days"] <= 0:
+        st.markdown(
+            '<div class="info-box">Geen actuele starter-data om de jaar-1 '
+            'impact tegen af te zetten — pas filter aan.</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.markdown(
+                _render_kpi_card("Uitgaven / jaar",
+                                 _imp_cur["design_uitgaven"],
+                                 _imp_base["design_uitgaven"],
+                                 lower_is_better=True),
+                unsafe_allow_html=True,
+            )
+        with k2:
+            st.markdown(
+                _render_kpi_card("Vergoeding / jaar",
+                                 _imp_cur["design_vergoeding"],
+                                 _imp_base["design_vergoeding"],
+                                 lower_is_better=False),
+                unsafe_allow_html=True,
+            )
+        with k3:
+            st.markdown(
+                _render_kpi_card("Marge / jaar",
+                                 _imp_cur["design_marge"],
+                                 _imp_base["design_marge"],
+                                 lower_is_better=False),
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "Per-medicijn jaar-1 projectie: elk medicijn gebruikt zijn eigen actuele "
+            "starter-dagen × prijs/dag · vergoeding/dag · marge/dag (prod_id-mix van het "
+            "ontwerp). Medicijnen die het ontwerp niet adresseert behouden hun actuele tarief. "
+            "Kleine regel toont verschil t.o.v. opgeslagen ontwerp."
+        )
 
 # ---------------------------------------------------------------------------
 # Layout: Sankey (links) + Prod_ID-picker per medicijn (rechts);
@@ -203,8 +322,8 @@ with picker_col:
     st.markdown('<div class="section-header">Prod_ID-mix per medicijn</div>',
                 unsafe_allow_html=True)
     st.caption(
-        "Vink per medicijn aan welke Prod_IDs gebruikt worden en geef "
-        "het aandeel op (sommeert per medicijn naar 100%)."
+        "Vink per medicijn aan welke Prod_IDs gebruikt worden — "
+        "geselecteerde Prod_IDs krijgen automatisch een gelijk aandeel."
     )
 
     mp = design.setdefault("medicine_products", {})
@@ -227,22 +346,22 @@ with picker_col:
         current_pids = [p["prod_id"] for p in current if p["prod_id"] in all_pids]
         if not current_pids and all_pids:
             current_pids = [all_pids[0]]
-        cur_lookup = {p["prod_id"]: float(p.get("share", 0)) for p in current}
 
         with st.expander(
             f"💊 {med}  ({len(current_pids)} prod_id geselecteerd)",
             expanded=False,
         ):
+            n_chosen = max(len(current_pids), 1)
+            equal_share = round(100.0 / n_chosen, 1)
+
             rows = med_options[[
                 "prod_id", "prod_nm", "prod_omschr",
                 "prijs_dag", "vergoeding_dag", "margin_dag",
                 "freq_dosage", "stuks_per_toediening",
             ]].copy()
             rows.insert(0, "Use", rows["prod_id"].astype(str).isin(current_pids))
-            default_w = round(100.0 / max(len(current_pids), 1), 1)
-            rows["Share %"] = rows["prod_id"].astype(str).map(
-                lambda pid: cur_lookup.get(pid, default_w if pid in current_pids else 0.0)
-            )
+            # Read-only display: shows the auto-equal split for ticked rows.
+            rows["Share %"] = rows["Use"].map(lambda used: equal_share if used else 0.0)
             rows = rows.rename(columns={
                 "prod_id":              "Prod_ID",
                 "prod_nm":              "Merknaam",
@@ -270,7 +389,8 @@ with picker_col:
                     "Freq dosering":    st.column_config.NumberColumn("Freq dosering",    disabled=True, format="%.0f"),
                     "Stuks/toediening": st.column_config.NumberColumn("Stuks/toediening", disabled=True, format="%.1f"),
                     "Share %":          st.column_config.NumberColumn(
-                        "Share %", min_value=0.0, max_value=100.0, step=1.0, format="%.1f"
+                        "Share %", disabled=True, format="%.1f",
+                        help="Automatisch gelijk verdeeld over de geselecteerde Prod_IDs.",
                     ),
                 },
                 key=f"prodpick_{med}",
@@ -282,16 +402,15 @@ with picker_col:
                 st.warning("Kies minstens één Prod_ID.")
                 continue
 
-            wtotal = float(chosen_df["Share %"].fillna(0).sum() or 0)
-            if abs(wtotal - 100.0) > 0.5:
-                st.markdown(
-                    f'<div class="warn-box">Som = {wtotal:.1f}% — moet 100% zijn.</div>',
-                    unsafe_allow_html=True,
-                )
-
+            # Equal split across the just-checked Prod_IDs. Largest entry
+            # absorbs the rounding remainder so the persisted shares sum to
+            # exactly 100 (validate_design tolerates 0.5%, but stay precise).
+            new_share = round(100.0 / len(chosen), 1)
+            shares = [new_share] * len(chosen)
+            shares[0] = round(shares[0] + (100.0 - sum(shares)), 1)
             new_mp_entry = [
-                {"prod_id": str(r["Prod_ID"]), "share": float(r["Share %"] or 0)}
-                for _, r in chosen_df.iterrows()
+                {"prod_id": pid, "share": shares[i]}
+                for i, pid in enumerate(chosen)
             ]
             if new_mp_entry != mp.get(med):
                 mp[med] = new_mp_entry
@@ -302,6 +421,72 @@ with picker_col:
     for stale_med in list(mp.keys()):
         if stale_med not in targets:
             mp.pop(stale_med, None)
+
+# ════════════════════════════════════════════════════════════════════════════
+# Wijzigingen t.o.v. opgeslagen ontwerp + Origineel-Sankey expander
+# (alleen wanneer er een baseline is)
+# ════════════════════════════════════════════════════════════════════════════
+if design_baseline is not None:
+    _diff = diff_designs(design_baseline, design)
+    with st.expander(
+        "📋 Wijzigingen t.o.v. opgeslagen ontwerp",
+        expanded=_diff["any_change"],
+    ):
+        if not _diff["any_change"]:
+            st.success("Geen wijzigingen — huidig ontwerp is identiek aan baseline.")
+        else:
+            if _diff["flow_changes"]:
+                st.markdown("**Aandelen per medicijn**")
+                _fc_df = pd.DataFrame([
+                    {
+                        "Medicijn": r["medicine"],
+                        "Source":   r["source"],
+                        "Oud %":    round(r["old_share"], 1),
+                        "Nieuw %":  round(r["new_share"], 1),
+                        "Δ %":      round(r["delta"], 1),
+                    }
+                    for r in _diff["flow_changes"]
+                ])
+                st.dataframe(_fc_df, hide_index=True, use_container_width=True)
+            if _diff["added_medicines"]:
+                st.markdown(
+                    f"**Toegevoegd**: {', '.join(_diff['added_medicines'])}"
+                )
+            if _diff["removed_medicines"]:
+                st.markdown(
+                    f"**Verwijderd**: {', '.join(_diff['removed_medicines'])}"
+                )
+            if _diff["product_changes"]:
+                st.markdown("**Prod_ID-mix gewijzigd**")
+                for _med, _rows in _diff["product_changes"].items():
+                    with st.expander(f"💊 {_med}"):
+                        _pc_df = pd.DataFrame([
+                            {
+                                "Prod_ID":  r["prod_id"],
+                                "Oud %":    round(r["old_share"], 1),
+                                "Nieuw %":  round(r["new_share"], 1),
+                                "Δ %":      round(r["delta"], 1),
+                            }
+                            for r in _rows
+                        ])
+                        st.dataframe(_pc_df, hide_index=True, use_container_width=True)
+
+    with st.expander(
+        "📊 Origineel ontwerp Sankey (opgeslagen baseline)",
+        expanded=False,
+    ):
+        if design_baseline.get("flows"):
+            _base_flows = design_to_flows_df(design_baseline)
+            _base_fig   = build_sankey_from_csv(
+                flows_df=_base_flows,
+                level="medicine_name",
+                diag_omschr_euk=f"{selected_diag} (origineel)",
+            )
+            st.plotly_chart(
+                _base_fig, use_container_width=True, key="baseline_sankey",
+            )
+        else:
+            st.info("Origineel ontwerp bevat geen flows.")
 
 # ════════════════════════════════════════════════════════════════════════════
 # Manually edit flows (collapsible, klein)
@@ -466,6 +651,9 @@ if save_clicked:
         st.error("Niet opgeslagen — eerst de volgende punten oplossen:\n\n- " + "\n- ".join(errs))
     else:
         path = save_design(design)
+        # Promote the just-saved design to baseline so deltas reset to 0 and
+        # the diff table immediately reflects "no changes vs. saved".
+        st.session_state[baseline_state_key] = copy.deepcopy(design)
         st.success(f"✅ Opgeslagen: `{os.path.basename(path)}`")
 
 # ════════════════════════════════════════════════════════════════════════════

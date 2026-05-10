@@ -33,16 +33,57 @@ SHARED_CSS = """
 <style>
 [data-testid="stAppViewContainer"] { background-color: #F6F8FA; }
 [data-testid="stSidebarNav"]       { display: none; }
-[data-testid="stSidebar"]          { background-color: #003545 !important; }
-[data-testid="stSidebar"] *        { color: #E0F2FE !important; }
-[data-testid="stSidebar"] input,
-[data-testid="stSidebar"] textarea                       { color: #003545 !important; }
-[data-testid="stSidebar"] button                         { color: #003545 !important; }
-[data-testid="stSidebar"] [data-baseweb="select"] *      { color: #003545 !important; }
-[data-testid="stSidebar"] [data-baseweb="input"] *       { color: #003545 !important; }
-[data-testid="stSidebar"] [data-baseweb="datepicker"] *  { color: #003545 !important; }
-[data-testid="stSidebar"] [data-testid="stAlert"],
-[data-testid="stSidebar"] [data-testid="stAlert"] *      { color: inherit !important; }
+
+/* ── Sidebar: neutral, ChatGPT-style ────────────────────────────────────── */
+[data-testid="stSidebar"] {
+    background-color: #F7F7F8 !important;
+    border-right: 1px solid #E5E7EB;
+}
+[data-testid="stSidebar"] * { color: #1F2937; }
+[data-testid="stSidebar"] hr {
+    border-color: #E5E7EB !important;
+    margin: 0.5rem 0 !important;
+}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    color: #4B5563 !important;
+}
+
+/* Brand + nav */
+.sidebar-brand {
+    font-size: 1.0rem;
+    font-weight: 600;
+    color: #111827;
+    letter-spacing: -0.01em;
+    padding: 4px 2px 10px 2px;
+}
+[data-testid="stSidebar"] [data-testid="stPageLink"] {
+    margin: 1px 0;
+}
+[data-testid="stSidebar"] [data-testid="stPageLink"] a {
+    border-radius: 6px;
+    padding: 6px 8px !important;
+    font-size: 0.9rem !important;
+    color: #1F2937 !important;
+    transition: background-color 0.12s ease;
+}
+[data-testid="stSidebar"] [data-testid="stPageLink"] a:hover {
+    background-color: #ECECF1 !important;
+}
+[data-testid="stSidebar"] [data-testid="stPageLink"] a p {
+    color: #1F2937 !important;
+    font-weight: 500 !important;
+}
+
+/* Inputs: keep neutral white surfaces */
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] [data-baseweb="input"] > div {
+    background-color: #FFFFFF !important;
+    border-color: #D1D5DB !important;
+}
+
 h1, h2, h3 { color: #0F1923 !important; }
 hr { border-color: #E5E7EB !important; }
 
@@ -121,6 +162,20 @@ def inject_shared_css() -> None:
     st.markdown(SHARED_CSS, unsafe_allow_html=True)
 
 
+def render_sidebar_nav() -> None:
+    """Brand + page navigation. Identical on every page."""
+    with st.sidebar:
+        st.page_link("pages/4_Upload.py",         label="Upload")
+        st.markdown("---")
+        st.markdown('<div class="sidebar-brand">Sankey-Ideas</div>',
+                    unsafe_allow_html=True)
+        st.page_link("pages/1_Aandacht_nodig.py", label="Aandacht nodig")
+        st.page_link("app.py",                    label="Samenvatting")
+        st.page_link("pages/2_Ontwerp.py",        label="Ontwerp")
+        st.page_link("pages/3_Implementatie.py",  label="Implementatie")
+        st.markdown("---")
+
+
 def render_sidebar(cache_df: pd.DataFrame) -> dict | None:
     """
     Render the shared sidebar (diagnose / datum / voorschrijver).
@@ -133,15 +188,11 @@ def render_sidebar(cache_df: pd.DataFrame) -> dict | None:
         if _k in st.session_state:
             st.session_state[_k] = st.session_state[_k]
 
-    with st.sidebar:
-        st.page_link("pages/4_Upload.py", label="📂 Upload", icon="📂")
-        st.markdown("---")
-        st.markdown("## ⚗️ Sankey-Ideas")
-        st.markdown("---")
+    render_sidebar_nav()
 
+    with st.sidebar:
         if cache_df.empty:
-            st.warning("Geen patiëntendata gevonden.")
-            st.page_link("pages/4_Upload.py", label="📂 Ga naar Upload", icon="📂")
+            st.info("Geen patiëntendata gevonden. Ga naar **Upload**.")
             return None
 
         diagnoses = sorted(cache_df["Diag_omschr_EUK"].dropna().unique().tolist())
@@ -189,7 +240,6 @@ def render_sidebar(cache_df: pd.DataFrame) -> dict | None:
         if "regen_end_date" not in st.session_state:
             st.session_state["regen_end_date"]   = st.session_state["persist_end_date"]
 
-        st.markdown("---")
         sd_col, ed_col = st.columns(2)
         with sd_col:
             regen_start = st.date_input("Start", key="regen_start_date")
@@ -207,11 +257,6 @@ def render_sidebar(cache_df: pd.DataFrame) -> dict | None:
             st.session_state["vrs_sel"] = prev_vrs if prev_vrs in vrs_opts else "Alle voorschrijvers"
         regen_vrs: str = st.selectbox("Voorschrijver", vrs_opts, key="vrs_sel")
         st.session_state["persist_vrs"] = regen_vrs
-
-        st.markdown("---")
-        st.page_link("app.py",                     label="📊 Samenvatting",  icon="📊")
-        st.page_link("pages/2_Ontwerp.py",         label="✏️ Ontwerp",       icon="✏️")
-        st.page_link("pages/3_Implementatie.py",   label="🔍 Implementatie", icon="🔍")
 
     return {
         "selected_diag": selected_diag,

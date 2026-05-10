@@ -420,11 +420,6 @@ if not is_all_diag:
                         st.session_state["selected_link_level"] = link_level
                         st.rerun()
 
-    st.markdown(
-        '<div class="info-box">Klik op een <b>flow</b> om behandeldagen aan te passen.</div>',
-        unsafe_allow_html=True,
-    )
-
     # ── Flow adjustment panel ──────────────────────────────────────────────
     sel_link  = st.session_state.get("selected_link")
     sel_level = st.session_state.get("selected_link_level", level)

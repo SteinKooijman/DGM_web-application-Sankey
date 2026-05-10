@@ -71,23 +71,59 @@ def list_designs(diag_omschr_euk: str) -> list[dict]:
 
 
 def save_design(design: dict) -> str:
-    """Persist a design JSON. Returns the absolute file path."""
+    """Persist a design JSON and two companion CSVs. Returns the JSON path.
+
+    Side-effect: alongside `<base>.json`, also writes
+      - `<base>_flows.csv`     — columns: source, source_layer, target, target_layer, share
+      - `<base>_products.csv`  — columns: medicine_name, prod_id, share
+    """
     os.makedirs(DESIGNS_DIR, exist_ok=True)
     diag = str(design.get("diagnosis", "diagnose"))
     slug = slugify(diag)
     ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     payload = dict(design)
     payload["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    fname = f"{slug}__{ts}.json"
-    path = os.path.join(DESIGNS_DIR, fname)
-    with open(path, "w", encoding="utf-8") as f:
+    base = f"{slug}__{ts}"
+    json_path = os.path.join(DESIGNS_DIR, f"{base}.json")
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
-    return path
+
+    # Companion CSVs (Excel-friendly).
+    flows_rows = payload.get("flows", []) or []
+    flows_df = pd.DataFrame(
+        flows_rows,
+        columns=["source", "source_layer", "target", "target_layer", "share"],
+    )
+    flows_df.to_csv(os.path.join(DESIGNS_DIR, f"{base}_flows.csv"), index=False)
+
+    prod_rows: list[dict] = []
+    for med, pids in (payload.get("medicine_products", {}) or {}).items():
+        for p in pids:
+            prod_rows.append({
+                "medicine_name": med,
+                "prod_id":       str(p.get("prod_id", "")),
+                "share":         float(p.get("share", 0) or 0),
+            })
+    products_df = pd.DataFrame(prod_rows, columns=["medicine_name", "prod_id", "share"])
+    products_df.to_csv(os.path.join(DESIGNS_DIR, f"{base}_products.csv"), index=False)
+
+    return json_path
 
 
 def load_design(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def latest_design_for(diag_omschr_euk: str) -> dict | None:
+    """Return the most recent saved design dict for this diagnosis, or None."""
+    items = list_designs(diag_omschr_euk)
+    if not items:
+        return None
+    try:
+        return load_design(items[0]["path"])
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -328,3 +364,144 @@ def design_medicine_rates(
             marge += w * _safe(row.get("margin_dag",     0))
         out[med] = {"prijs_dag": prijs, "vergoeding_dag": verg, "margin_dag": marge}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Whole-design totals (KPI strip on the Ontwerp page)
+# ---------------------------------------------------------------------------
+
+def compute_design_totals(
+    design: dict,
+    catalogue_df: pd.DataFrame,
+    n_patients: int = 100,
+) -> dict[str, float]:
+    """
+    Return totals per dag for the entire design at `n_patients` patients:
+      {"vergoeding": ..., "uitgaven": ..., "marge": ...}
+
+    Uses `design_medicine_rates` for the prod_id-weighted per-medicine daily
+    rates, then weights by each flow's share (% of patients reaching that
+    medicine from a layer-0 source).
+    """
+    rates = design_medicine_rates(design, catalogue_df)
+    totals = {"vergoeding": 0.0, "uitgaven": 0.0, "marge": 0.0}
+    for f in design.get("flows", []) or []:
+        # Only count flows starting from a layer-0 source — those describe the
+        # share of all `n_patients`. Downstream layers describe transitions
+        # within already-counted patients (would double-count their daily cost).
+        if int(f.get("source_layer", 0)) != 0:
+            continue
+        med = str(f.get("target", ""))
+        r = rates.get(med)
+        if r is None:
+            continue
+        n_pat = float(n_patients) * (float(f.get("share", 0) or 0) / 100.0)
+        totals["uitgaven"]   += n_pat * r["prijs_dag"]
+        totals["vergoeding"] += n_pat * r["vergoeding_dag"]
+        totals["marge"]      += n_pat * r["margin_dag"]
+    return totals
+
+
+# ---------------------------------------------------------------------------
+# Structured diff between two designs (for the "Wijzigingen" expander)
+# ---------------------------------------------------------------------------
+
+_DIFF_EPS = 0.05  # percentage points — tighter and rounding noise pollutes
+
+
+def _flow_share_map(design: dict) -> dict[tuple[str, int, str, int], float]:
+    out: dict[tuple[str, int, str, int], float] = {}
+    for f in design.get("flows", []) or []:
+        key = (
+            str(f.get("source", "")),
+            int(f.get("source_layer", 0)),
+            str(f.get("target", "")),
+            int(f.get("target_layer", 1)),
+        )
+        out[key] = float(f.get("share", 0) or 0)
+    return out
+
+
+def _product_share_map(design: dict, med: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for p in (design.get("medicine_products", {}) or {}).get(med, []) or []:
+        out[str(p.get("prod_id", ""))] = float(p.get("share", 0) or 0)
+    return out
+
+
+def diff_designs(baseline: dict | None, current: dict) -> dict:
+    """
+    Compare two design dicts at medicine-flow level and per-medicine
+    prod_id-mix level. Returns a structured diff (see plan for shape).
+    """
+    empty = {
+        "flow_changes":      [],
+        "added_medicines":   [],
+        "removed_medicines": [],
+        "product_changes":   {},
+        "any_change":        False,
+    }
+    if baseline is None:
+        return empty
+
+    base_flows = _flow_share_map(baseline)
+    curr_flows = _flow_share_map(current)
+
+    flow_changes: list[dict] = []
+    added_meds: set[str] = set()
+    removed_meds: set[str] = set()
+
+    all_keys = set(base_flows) | set(curr_flows)
+    for key in all_keys:
+        old = base_flows.get(key, 0.0)
+        new = curr_flows.get(key, 0.0)
+        delta = new - old
+        if abs(delta) <= _DIFF_EPS:
+            continue
+        med = key[2]
+        flow_changes.append({
+            "medicine":  med,
+            "source":    key[0],
+            "old_share": old,
+            "new_share": new,
+            "delta":     delta,
+        })
+        if key not in base_flows:
+            added_meds.add(med)
+        elif key not in curr_flows:
+            removed_meds.add(med)
+
+    flow_changes.sort(key=lambda r: -abs(r["delta"]))
+
+    # Prod_id mix changes per medicine (any medicine appearing in either side)
+    prod_changes: dict[str, list[dict]] = {}
+    base_meds = set((baseline.get("medicine_products") or {}).keys())
+    curr_meds = set((current.get("medicine_products")  or {}).keys())
+    for med in base_meds | curr_meds:
+        old_map = _product_share_map(baseline, med)
+        new_map = _product_share_map(current,  med)
+        rows: list[dict] = []
+        for pid in set(old_map) | set(new_map):
+            old = old_map.get(pid, 0.0)
+            new = new_map.get(pid, 0.0)
+            delta = new - old
+            if abs(delta) <= _DIFF_EPS:
+                continue
+            rows.append({
+                "prod_id":   pid,
+                "old_share": old,
+                "new_share": new,
+                "delta":     delta,
+            })
+        if rows:
+            rows.sort(key=lambda r: -abs(r["delta"]))
+            prod_changes[med] = rows
+
+    any_change = bool(flow_changes) or bool(prod_changes)
+    return {
+        "flow_changes":      flow_changes,
+        "added_medicines":   sorted(added_meds),
+        "removed_medicines": sorted(removed_meds),
+        "product_changes":   prod_changes,
+        "any_change":        any_change,
+    }

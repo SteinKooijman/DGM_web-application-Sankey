@@ -22,6 +22,7 @@ import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.budget_impact import compute_budget_impact
 from backend.csv_builder import load_catalogue_csv, load_patient_cache, load_sankey_csv
 from backend.design_io import design_to_flows_df, list_designs, load_design
 from backend.divergence import compute_divergence, voorschrijver_breakdown
@@ -132,6 +133,42 @@ st.markdown('<div class="section-header">Financiële impact van afwijkingen</div
 pat_window = filter_records_in_window(
     cache_df, selected_diag, regen_start, regen_end, regen_vrs
 )
+
+# ── Year-1 budget-impact KPIs (methodology) ──────────────────────────────
+impact = compute_budget_impact(design, data_agg, pat_window, catalogue_df)
+
+if impact["baseline_starter_days"] <= 0:
+    st.info(
+        "Geen actuele starter-data in dit filter om de jaar-1 budget-impact "
+        "te berekenen. Pas datumvenster of voorschrijver aan."
+    )
+else:
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric(
+            "Δ Kosten / jaar (ontwerp − actueel)",
+            _fmt_eur(impact["delta_uitgaven"]),
+            delta_color="inverse",
+        )
+    with k2:
+        st.metric(
+            "Δ Marge / jaar (ontwerp − actueel)",
+            _fmt_eur(impact["delta_marge"]),
+        )
+    with k3:
+        st.metric(
+            "Netto besparing / jaar",
+            _fmt_eur(impact["net_savings"]),
+        )
+    st.caption(
+        "Per-medicijn jaar-1 projectie: elk medicijn gebruikt zijn eigen actuele "
+        f"starter-dagen ({impact['baseline_starter_days']:,.0f} dgn totaal) × tarief "
+        "(actueel of ontwerp prod_id-mix). Medicijnen die het ontwerp niet adresseert "
+        "behouden hun actuele tarief en dragen 0 bij aan de delta. Negatieve Δ kosten "
+        "= ontwerp bespaart geld; netto besparing = actuele kosten − ontwerp kosten."
+    )
+
+# ── Per-flow divergence (existing detailed analysis below) ───────────────
 divergence = compute_divergence(design, data_agg, pat_window, catalogue_df)
 
 if divergence.empty:
@@ -140,22 +177,6 @@ if divergence.empty:
 
 # Materially divergent flows = > 0.5 percentpunt afwijking
 material = divergence[divergence["delta_share"].abs() > 0.5].copy()
-
-tot_uit  = float(material["delta_uitgaven"].sum())
-tot_verg = float(material["delta_vergoeding"].sum())
-tot_mar  = float(material["delta_marge"].sum())
-
-k1, k2, k3 = st.columns(3)
-with k1:
-    st.metric("Δ Uitgaven (data − ontwerp)",   _fmt_eur(tot_uit),  delta_color="inverse")
-with k2:
-    st.metric("Δ Vergoeding (data − ontwerp)", _fmt_eur(tot_verg))
-with k3:
-    st.metric("Δ Marge (data − ontwerp)",      _fmt_eur(tot_mar))
-st.caption(
-    "Negatieve marge betekent: de praktijk wijkt af van het ontwerp en dat "
-    "kost marge. Berekening: Δ behandeldagen × (data marge/dag − ontwerp marge/dag)."
-)
 
 # ── Tabel afwijkende flows ────────────────────────────────────────────────
 st.markdown('<div class="section-header">Afwijkende flows</div>',
